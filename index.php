@@ -627,16 +627,16 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   #toolbar input[type=search]{width:100px;padding:.3rem .5rem;font-size:.78rem}
   .btn-logout{padding:.3rem .5rem;font-size:.85rem}
   #toolbar span[style]{display:none}
-  /* 2 colonnes fixes en portrait */
-  #card-grid{grid-template-columns:repeat(2,1fr)!important;gap:.5rem;padding:.5rem}
+  /* 3 colonnes, max 4 lignes visibles puis scroll */
+  #card-grid{grid-template-columns:repeat(3,1fr)!important;gap:.3rem;padding:.3rem}
   .card-poster,.card-poster-placeholder{aspect-ratio:2/3}
-  .card-body{padding:.35rem .45rem;gap:.2rem}
-  .card-title{font-size:.76rem;-webkit-line-clamp:2}
-  .card-year{font-size:.68rem}
+  .card-body{padding:.25rem .3rem;gap:.15rem}
+  .card-title{font-size:.68rem;-webkit-line-clamp:2}
+  .card-year{font-size:.6rem}
   .card-overview{display:none}
-  .card-rating{font-size:.7rem}
-  .card-footer{padding:.25rem .4rem;gap:.2rem}
-  .card-btn{padding:.18rem .35rem;font-size:.67rem}
+  .card-rating{font-size:.62rem}
+  .card-footer{padding:.2rem .3rem;gap:.15rem;flex-wrap:wrap}
+  .card-btn{padding:.15rem .28rem;font-size:.6rem}
   .col-date,.col-size{display:none}
   td{padding:.4rem .5rem}
 }
@@ -1013,8 +1013,8 @@ function fetchOne(filename) {
     .then(function(r){ return r.json(); })
     .then(function(data) {
       if (data.ok && data.data) {
-        var cardId = 'card-' + md5hex(filename);
-        var card = document.getElementById(cardId);
+        // Use data-name attribute to find the card (avoids md5 mismatch)
+        var card = document.querySelector('#card-grid .card[data-name="' + filename.replace(/"/g,'&quot;') + '"]');
         if (card) refreshCard(card, filename, data.data);
       }
       return data;
@@ -1022,25 +1022,31 @@ function fetchOne(filename) {
 }
 
 function refreshCard(card, filename, d) {
-  if (d.poster_path) {
-    var img = card.querySelector('.card-poster, .card-poster-placeholder');
+  // Update poster — prefer local path returned by server
+  var posterSrc = d.poster_local ? d.poster_local
+                : (d.poster_path ? 'https://image.tmdb.org/t/p/w300' + d.poster_path : '');
+  if (posterSrc) {
+    var oldImg = card.querySelector('.card-poster, .card-poster-placeholder');
     var newImg = document.createElement('img');
     newImg.className = 'card-poster';
-    newImg.src = 'https://image.tmdb.org/t/p/w300' + d.poster_path;
+    newImg.src = posterSrc;
     newImg.alt = '';
-    newImg.setAttribute('loading','lazy');
-    if (img) img.parentNode.replaceChild(newImg, img);
+    newImg.setAttribute('loading', 'lazy');
+    if (oldImg) oldImg.parentNode.replaceChild(newImg, oldImg);
   }
+  // Update body
   var body = card.querySelector('.card-body');
   if (body) {
-    var title = d.title || filename;
-    var year  = d.year  ? ' <span class="card-year" style="display:inline">' + d.year + '</span>' : '';
+    var sizeText = '';
+    var yr = body.querySelector('.card-year');
+    if (yr) { var parts = yr.textContent.split('—'); sizeText = parts.length > 1 ? parts[1].trim() : ''; }
     var stars = d.rating ? '<div class="card-rating">' + renderStars(d.rating) + '</div>' : '';
     var ov    = d.overview ? '<div class="card-overview">' + escH(d.overview) + '</div>' : '';
-    body.innerHTML = '<div class="card-title">' + escH(title) + '</div>'
-                   + '<div class="card-year">' + (d.year||'') + ' — ' + body.querySelector('.card-year') && body.querySelector('.card-year').textContent.split('—')[1] || '' + '</div>'
+    body.innerHTML = '<div class="card-title">' + escH(d.title || filename) + '</div>'
+                   + '<div class="card-year">' + (d.year || '') + (sizeText ? ' — ' + sizeText : '') + '</div>'
                    + stars + ov;
   }
+  // Remove "not found" badge if present
   var nf = card.querySelector('.card-not-found');
   if (nf) nf.parentNode.removeChild(nf);
 }
