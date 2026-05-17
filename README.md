@@ -1,4 +1,4 @@
-# php-film-manager
+# cinenas
 
 Gestionnaire de films auto-hébergé en PHP, avec affichage des affiches, notes et synopsis via l'API TMDB.
 
@@ -28,8 +28,8 @@ Gestionnaire de films auto-hébergé en PHP, avec affichage des affiches, notes 
 ### 1. Cloner le dépôt
 
 ```bash
-git clone https://github.com/votre-user/php-film-manager.git
-cd php-film-manager
+git clone https://github.com/votre-user/cinenas.git
+cd cinenas
 ```
 
 ### 2. Créer le fichier de configuration
@@ -61,8 +61,8 @@ Pointer le DocumentRoot (ou un VirtualHost) vers le répertoire du projet.
 Exemple Apache :
 ```apache
 <VirtualHost *:8888>
-    DocumentRoot /chemin/vers/php-film-manager
-    <Directory /chemin/vers/php-film-manager>
+    DocumentRoot /chemin/vers/cinenas
+    <Directory /chemin/vers/cinenas>
         AllowOverride None
         Require all granted
     </Directory>
@@ -72,7 +72,7 @@ Exemple Apache :
 ## Structure des fichiers
 
 ```
-php-film-manager/
+cinenas/
 ├── index.php            # Application principale (tout-en-un)
 ├── config.php           # Secrets (exclu du dépôt git)
 ├── config.sample.php    # Modèle de configuration à copier
