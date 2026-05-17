@@ -17,7 +17,6 @@ define('FM_ROOT',          realpath(__DIR__));
 define('FM_TITLE',         'File Manager');
 define('FM_MAX_UPLOAD_MB', 512);
 define('FM_DEMO_MODE',     false);
-define('FM_META_FILE',     FM_ROOT . DIRECTORY_SEPARATOR . '.movies_meta.json');
 define('FM_ALLOWED_EXT',   implode(',', array(
     'mkv','mp4','avi','mov','wmv','flv','mpg','mpeg','m4v','3gp','ts','webm',
     'jpg','jpeg','png','gif','webp','svg','ico','bmp',
@@ -74,8 +73,17 @@ if (!authed()) { render_login($login_error); exit; }
 
 // ── Path safety ────────────────────────────────────────────────────────────────
 function jail($rel) {
-    $abs = realpath(FM_ROOT . DIRECTORY_SEPARATOR . ltrim($rel, '/\\'));
-    if ($abs === false || strncmp($abs, FM_ROOT, strlen(FM_ROOT)) !== 0) return false;
+    // Normalize without resolving symlinks (realpath() would follow symlinks to
+    // other mount points and fail the FM_ROOT prefix check)
+    $raw   = FM_ROOT . DIRECTORY_SEPARATOR . ltrim($rel, '/\\');
+    $parts = array();
+    foreach (explode(DIRECTORY_SEPARATOR, str_replace(array('/', '\\'), DIRECTORY_SEPARATOR, $raw)) as $p) {
+        if ($p === '..') { array_pop($parts); }
+        elseif ($p !== '.' && $p !== '') { $parts[] = $p; }
+    }
+    $abs = DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $parts);
+    if (strncmp($abs, FM_ROOT, strlen(FM_ROOT)) !== 0) return false;
+    if (!file_exists($abs)) return false;
     return $abs;
 }
 function jail_new($rel) {
@@ -85,7 +93,7 @@ function jail_new($rel) {
         if ($p === '..') { array_pop($parts); }
         elseif ($p !== '.' && $p !== '') { $parts[] = $p; }
     }
-    $abs = implode(DIRECTORY_SEPARATOR, $parts);
+    $abs = DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $parts);
     if (strncmp($abs, FM_ROOT, strlen(FM_ROOT)) !== 0) return false;
     return $abs;
 }
@@ -142,15 +150,24 @@ function safe_filename($name) {
     return preg_replace('/[^A-Za-z0-9._\-\(\) \[\]]/', '_', $name);
 }
 
+// ── Per-directory metadata helpers ─────────────────────────────────────────────
+function meta_file_for($dir)    { return $dir . DIRECTORY_SEPARATOR . '.movies_meta.json'; }
+function posters_dir_for($dir)  { return $dir . DIRECTORY_SEPARATOR . '.posters'; }
+function posters_url_for($dir)  {
+    $rel = ltrim(substr(realpath($dir), strlen(FM_ROOT)), DIRECTORY_SEPARATOR);
+    $base = ($rel === '') ? '' : str_replace(DIRECTORY_SEPARATOR, '/', $rel) . '/';
+    return $base . '.posters/';
+}
+
 // ── Movie metadata ─────────────────────────────────────────────────────────────
-function meta_load() {
-    $f = FM_META_FILE;
+function meta_load($dir) {
+    $f = meta_file_for($dir);
     if (!file_exists($f)) return array();
     $data = json_decode(file_get_contents($f), true);
     return is_array($data) ? $data : array();
 }
-function meta_save($data) {
-    file_put_contents(FM_META_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+function meta_save($data, $dir) {
+    file_put_contents(meta_file_for($dir), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 }
 function parse_movie_name($filename) {
     // Remove extension
@@ -204,6 +221,28 @@ function tmdb_fetch($title, $year = null) {
         'fetched_at'  => time(),
     );
 }
+function poster_download($poster_path, $dir) {
+    if (!$poster_path) return '';
+    $posters_dir = posters_dir_for($dir);
+    $posters_url = posters_url_for($dir);
+    if (!is_dir($posters_dir)) {
+        @mkdir($posters_dir, 0755, true);
+    }
+    $local_name = md5($poster_path) . '.jpg';
+    $local_path = $posters_dir . DIRECTORY_SEPARATOR . $local_name;
+    if (file_exists($local_path)) {
+        return $posters_url . $local_name;
+    }
+    $url = 'https://image.tmdb.org/t/p/w300' . $poster_path;
+    $ctx = stream_context_create(array('http' => array('timeout' => 10)));
+    $img = @file_get_contents($url, false, $ctx);
+    if ($img) {
+        file_put_contents($local_path, $img);
+        return $posters_url . $local_name;
+    }
+    return '';
+}
+
 function star_html($rating) {
     if ($rating === null) return '<span class="no-rating">—</span>';
     $pct = round(($rating / 10) * 100);
@@ -259,17 +298,21 @@ if ($get_action === 'fetch_meta') {
     if (!FM_TMDB_API_KEY) { echo json_encode(array('error' => 'No API key')); exit; }
     $filename = isset($_GET['file']) ? basename($_GET['file']) : '';
     if (!$filename) { echo json_encode(array('error' => 'No file')); exit; }
-    $meta  = meta_load();
-    $parsed = parse_movie_name($filename);
-    $result = tmdb_fetch($parsed['title'], $parsed['year']);
+    $ajax_cwd = current_dir();
+    $meta     = meta_load($ajax_cwd);
+    $parsed   = parse_movie_name($filename);
+    $result   = tmdb_fetch($parsed['title'], $parsed['year']);
     if ($result) {
+        if (!empty($result['poster_path'])) {
+            $local = poster_download($result['poster_path'], $ajax_cwd);
+            if ($local) $result['poster_local'] = $local;
+        }
         $meta[$filename] = $result;
-        meta_save($meta);
+        meta_save($meta, $ajax_cwd);
         echo json_encode(array('ok' => true, 'data' => $result));
     } else {
-        // Store a placeholder so we don't re-fetch endlessly
         $meta[$filename] = array('not_found' => true, 'fetched_at' => time());
-        meta_save($meta);
+        meta_save($meta, $ajax_cwd);
         echo json_encode(array('ok' => false, 'error' => 'Not found on TMDB'));
     }
     exit;
@@ -278,11 +321,12 @@ if ($get_action === 'fetch_meta') {
 // ── Delete meta entry (AJAX, GET) ─────────────────────────────────────────────
 if ($get_action === 'delete_meta') {
     header('Content-Type: application/json');
+    $ajax_cwd = current_dir();
     $filename = isset($_GET['file']) ? basename($_GET['file']) : '';
     if ($filename) {
-        $meta = meta_load();
+        $meta = meta_load($ajax_cwd);
         unset($meta[$filename]);
-        meta_save($meta);
+        meta_save($meta, $ajax_cwd);
     }
     echo json_encode(array('ok' => true)); exit;
 }
@@ -352,19 +396,23 @@ if (!FM_DEMO_MODE && $_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // ── Scan directory ─────────────────────────────────────────────────────────────
-$meta_all = meta_load();
 $cwd     = current_dir();
 $cwd_rel = relpath($cwd);
-$ignore  = array('.', '..', basename(__FILE__), '.DS_Store', 'Thumbs.db',
-                 '.movies_meta.json', '.@__thumb', '.@__qini', '@Transcode', '.deletedByTMM',
+$meta_all = meta_load($cwd);
+$ignore      = array('.', '..', basename(__FILE__), '.DS_Store', 'Thumbs.db',
+                 '.movies_meta.json', '.posters', '.@__thumb', '.@__qini', '@Transcode', '.deletedByTMM',
                  'listr.css', 'listr-favicon.png', 'index.php_old', 'filemanager.php');
-$video_ext = array('mkv','mp4','avi','mov','wmv','flv','mpg','mpeg','m4v','3gp','ts','webm','divx','xvid');
-$dirs = $files = array();
+$ignore_ext  = array('php', 'php3', 'php4', 'php5', 'phtml', 'sh', 'bash', 'py', 'pl', 'rb');
+$video_ext    = array('mkv','mp4','avi','mov','wmv','flv','mpg','mpeg','m4v','3gp','ts','webm','divx','xvid');
+$subtitle_ext = array('srt','sub','ass','ssa','vtt');
+$dirs = $files = $subs_by_base = array();
 $total_bytes = 0;
 
 if ($dh = opendir($cwd)) {
     while (($e = readdir($dh)) !== false) {
         if (in_array($e, $ignore, true)) continue;
+        $ext_check = strtolower(pathinfo($e, PATHINFO_EXTENSION));
+        if (in_array($ext_check, $ignore_ext, true)) continue;
         $abs  = $cwd . DIRECTORY_SEPARATOR . $e;
         $stat = @stat($abs);
         $rel  = ($cwd_rel ? $cwd_rel . '/' : '') . $e;
@@ -373,15 +421,35 @@ if ($dh = opendir($cwd)) {
             'rel'   => $rel,
             'mtime' => ($stat && isset($stat['mtime'])) ? $stat['mtime'] : 0,
             'bytes' => ($stat && isset($stat['size']))  ? sprintf('%u', $stat['size']) : 0,
-            'ext'   => strtolower(pathinfo($e, PATHINFO_EXTENSION)),
+            'ext'   => $ext_check,
         );
-        if (is_dir($abs)) $dirs[] = $item;
-        else { $total_bytes += (float)sprintf('%u', $item['bytes']); $files[] = $item; }
+        if (is_dir($abs)) {
+            $dirs[] = $item;
+        } elseif (in_array($ext_check, $subtitle_ext, true)) {
+            // Index subtitle by lowercase base name for case-insensitive lookup
+            $base = strtolower(pathinfo($e, PATHINFO_FILENAME));
+            if (!isset($subs_by_base[$base])) $subs_by_base[$base] = array();
+            $subs_by_base[$base][] = $item;
+        } else {
+            $total_bytes += (float)sprintf('%u', $item['bytes']);
+            $files[] = $item;
+        }
     }
     closedir($dh);
 }
 usort($dirs,  function($a, $b) { return strcasecmp($a['name'], $b['name']); });
 usort($files, function($a, $b) { return $b['mtime'] - $a['mtime']; });
+
+// ── Purge stale metadata entries (file in JSON but no longer on filesystem) ────
+if (!empty($meta_all)) {
+    $fs_names = array();
+    foreach ($files as $f) { $fs_names[$f['name']] = true; }
+    $stale = array_diff_key($meta_all, $fs_names);
+    if (!empty($stale)) {
+        foreach (array_keys($stale) as $k) { unset($meta_all[$k]); }
+        meta_save($meta_all, $cwd);
+    }
+}
 
 $dir_url = $cwd_rel ? '?dir=' . urlencode($cwd_rel) : '?';
 
@@ -431,20 +499,27 @@ button:hover{background:#4f46e5}
 body{background:#111827;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:.92rem}
 a{color:#818cf8;text-decoration:none}a:hover{text-decoration:underline}
 #app{display:flex;flex-direction:column;min-height:100vh}
-#topbar{background:#1f2937;border-bottom:1px solid #374151;
-        padding:.65rem 1.2rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}
-#topbar h1{font-size:1.05rem;font-weight:700;color:#a5b4fc;white-space:nowrap}
-#breadcrumbs{flex:1;font-size:.85rem;color:#9ca3af;min-width:0;overflow:hidden;
-             text-overflow:ellipsis;white-space:nowrap}
-#breadcrumbs a{color:#c4b5fd}
-#breadcrumbs .sep{color:#4b5563}
-#topbar input[type=search]{background:#111827;border:1px solid #374151;border-radius:6px;
-  padding:.45rem .75rem;color:#e5e7eb;width:180px;outline:none;font-size:.85rem}
-#topbar a.btn-logout{background:#374151;color:#e5e7eb;padding:.45rem .85rem;
-  border-radius:6px;font-size:.82rem;white-space:nowrap}
-#topbar a.btn-logout:hover{background:#4b5563;text-decoration:none}
-#toolbar{padding:.6rem 1.2rem;display:flex;gap:.5rem;flex-wrap:wrap;
-         background:#1a2332;border-bottom:1px solid #374151;align-items:center}
+.btn-logout{background:#374151;color:#e5e7eb;padding:.4rem .6rem;
+  border-radius:6px;font-size:1rem;text-decoration:none;flex-shrink:0}
+.btn-logout:hover{background:#7f1d1d;color:#fff}
+#toolbar input[type=search]{background:#111827;border:1px solid #374151;border-radius:6px;
+  padding:.4rem .7rem;color:#e5e7eb;width:180px;outline:none;font-size:.84rem;flex-shrink:0}
+#toolbar input[type=search]:focus{border-color:#6366f1}
+.home-chip{display:inline-flex;align-items:center;padding:.35rem .6rem;
+           background:#1e2533;color:#9ca3af;border-radius:8px;text-decoration:none;
+           font-size:1rem;border:1px solid #374151;flex-shrink:0}
+.home-chip:hover{background:#312e81;color:#fff;border-color:#6366f1}
+#toolbar{padding:.6rem 1.2rem;display:flex;gap:.5rem;
+         background:#1a2332;border-bottom:1px solid #374151;align-items:center;
+         overflow-x:auto;white-space:nowrap;flex-wrap:nowrap}
+#dir-nav{display:flex;gap:.4rem;align-items:center;flex:1;overflow-x:auto;min-width:0}
+#dir-nav::-webkit-scrollbar{height:4px}
+#dir-nav::-webkit-scrollbar-thumb{background:#374151;border-radius:2px}
+.dir-chip{display:inline-flex;align-items:center;gap:.3rem;padding:.35rem .75rem;
+          background:#243044;color:#c4b5fd;border-radius:20px;text-decoration:none;
+          font-size:.82rem;font-weight:500;border:1px solid #374151;flex-shrink:0}
+.dir-chip:hover{background:#312e81;border-color:#6366f1;color:#fff}
+.dir-chip.parent{color:#9ca3af;background:#1e2533}
 .btn{display:inline-flex;align-items:center;gap:.35rem;padding:.45rem .9rem;
      border:none;border-radius:6px;cursor:pointer;font-size:.84rem;font-weight:500;
      text-decoration:none;white-space:nowrap}
@@ -503,11 +578,9 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 .empty span{font-size:2.5rem;display:block;margin-bottom:.75rem}
 #footer{padding:.6rem 1.2rem;font-size:.78rem;color:#4b5563;
         border-top:1px solid #1f2937;display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
-@media(max-width:600px){.col-date{display:none}#topbar input[type=search]{width:130px}}
 /* ── Card grid ── */
 #card-grid{display:none;padding:1rem 1.2rem;
-  display:none;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1.2rem}
-#card-grid.active{display:grid}
+  grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1.2rem}
 #file-table-wrap.hidden{display:none}
 .card{background:#1f2937;border-radius:10px;overflow:hidden;
       display:flex;flex-direction:column;transition:.2s;position:relative}
@@ -542,35 +615,67 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 #sync-bar{display:none;padding:.4rem 1.2rem;background:#1e1b4b;font-size:.82rem;color:#a5b4fc;
           border-bottom:1px solid #374151}
 #sync-bar.active{display:block}
+.card-btn.card-btn-sub{background:#065f46;color:#6ee7b7}.card-btn.card-btn-sub:hover{background:#047857}
 .btn-active{background:#4f46e5!important}
+/* ── Mobile ── */
+@media(max-width:600px){
+  #toolbar{padding:.4rem .6rem;gap:.3rem}
+  .home-chip{padding:.3rem .5rem;font-size:.9rem}
+  .dir-chip{padding:.25rem .55rem;font-size:.75rem}
+  #btn-list,#btn-grid{padding:.35rem .55rem;font-size:.85rem}
+  #btn-sync{padding:.35rem .55rem;font-size:.8rem}
+  #toolbar input[type=search]{width:100px;padding:.3rem .5rem;font-size:.78rem}
+  .btn-logout{padding:.3rem .5rem;font-size:.85rem}
+  #toolbar span[style]{display:none}
+  /* 2 colonnes fixes en portrait */
+  #card-grid{grid-template-columns:repeat(2,1fr)!important;gap:.5rem;padding:.5rem}
+  .card-poster,.card-poster-placeholder{aspect-ratio:2/3}
+  .card-body{padding:.35rem .45rem;gap:.2rem}
+  .card-title{font-size:.76rem;-webkit-line-clamp:2}
+  .card-year{font-size:.68rem}
+  .card-overview{display:none}
+  .card-rating{font-size:.7rem}
+  .card-footer{padding:.25rem .4rem;gap:.2rem}
+  .card-btn{padding:.18rem .35rem;font-size:.67rem}
+  .col-date,.col-size{display:none}
+  td{padding:.4rem .5rem}
+}
+@media(min-width:601px) and (max-width:900px){
+  #card-grid{grid-template-columns:repeat(3,1fr)!important}
+}
 </style>
 </head>
 <body>
 <div id="app">
 
-<div id="topbar">
-  <h1>🗂 <?php echo FM_TITLE; ?></h1>
-  <div id="breadcrumbs"><?php echo breadcrumbs($cwd_rel); ?></div>
-  <input type="search" id="search" placeholder="Filter…" oninput="filterRows(this.value)" autocomplete="off">
-  <a class="btn-logout" href="?logout=1">Sign out</a>
-</div>
-
 <div id="toolbar">
-  <?php if (!FM_DEMO_MODE): ?>
-  <button class="btn btn-primary" onclick="openModal('upload-modal')">⬆ Upload</button>
-  <button class="btn btn-secondary" onclick="openModal('mkdir-modal')">📁 New folder</button>
-  <?php endif; ?>
+  <a class="home-chip" href="?" title="Accueil">🏠</a>
+  <div id="dir-nav">
+    <?php if ($cwd_rel !== ''): ?>
+    <?php
+      $parent_rel = dirname($cwd_rel);
+      $parent_url = ($parent_rel === '.' || $parent_rel === '') ? '?' : '?dir=' . urlencode($parent_rel);
+    ?>
+    <a class="dir-chip parent" href="<?php echo $parent_url; ?>">← ..</a>
+    <?php endif; ?>
+    <?php foreach ($dirs as $item): ?>
+    <a class="dir-chip" href="?dir=<?php echo urlencode($item['rel']); ?>">📁 <?php echo h($item['name']); ?></a>
+    <?php endforeach; ?>
+    <?php if (empty($dirs)): ?>
+    <span style="color:#4b5563;font-size:.82rem;font-style:italic">Aucun sous-dossier</span>
+    <?php endif; ?>
+  </div>
   <?php if (FM_TMDB_API_KEY): ?>
-  <button class="btn btn-secondary" id="btn-sync" onclick="startSync()">🎬 Sync métadonnées</button>
+  <button class="btn btn-secondary" id="btn-sync" onclick="startSync()">🎬 Sync</button>
   <?php endif; ?>
-  <span style="flex:1"></span>
-  <button class="btn btn-secondary" id="btn-list" onclick="setView('list')" title="Vue liste">☰ Liste</button>
-  <button class="btn btn-secondary" id="btn-grid" onclick="setView('grid')" title="Vue grille">⊞ Grille</button>
-  <span style="color:#6b7280;font-size:.82rem">
-    <?php echo count($dirs); ?> dossier<?php echo count($dirs) != 1 ? 's' : ''; ?>,
+  <button class="btn btn-secondary" id="btn-list" onclick="setView('list')" title="Vue liste">☰</button>
+  <button class="btn btn-secondary" id="btn-grid" onclick="setView('grid')" title="Vue grille">⊞</button>
+  <span style="color:#6b7280;font-size:.82rem;flex-shrink:0">
     <?php echo count($files); ?> film<?php echo count($files) != 1 ? 's' : ''; ?>
     <?php echo count($files) ? ' — ' . fmt_size($total_bytes) : ''; ?>
   </span>
+  <input type="search" id="search" placeholder="Rechercher…" oninput="filterRows(this.value)" autocomplete="off">
+  <a class="btn-logout" href="?logout=1" title="Se déconnecter">⏻</a>
 </div>
 
 <div id="sync-bar">⏳ Synchronisation en cours… <span id="sync-progress"></span></div>
@@ -590,15 +695,18 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   $m      = isset($meta_all[$item['name']]) ? $meta_all[$item['name']] : null;
   $is_vid = in_array($item['ext'], $video_ext, true);
   if (!$is_vid) continue;
-  $poster = ($m && !empty($m['poster_path']))
-          ? 'https://image.tmdb.org/t/p/w300' . $m['poster_path']
-          : '';
+  $poster = '';
+  if ($m && !empty($m['poster_local'])) {
+      $poster = $m['poster_local'];          // fichier local en priorité
+  } elseif ($m && !empty($m['poster_path'])) {
+      $poster = 'https://image.tmdb.org/t/p/w300' . $m['poster_path']; // fallback CDN
+  }
   $tmdb_url    = ($m && !empty($m['tmdb_id']))
                ? 'https://www.themoviedb.org/movie/' . $m['tmdb_id']
                : '';
   $alloc_title = ($m && !empty($m['title'])) ? $m['title'] : pathinfo($item['name'], PATHINFO_FILENAME);
   $alloc_url   = 'https://www.allocine.fr/rechercher/movie/?q=' . urlencode($alloc_title);
-  $not_found   = ($m && !empty($m['not_found']));
+  $subs = isset($subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))]) ? $subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))] : array();
 ?>
 <div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>">
   <?php if ($poster): ?>
@@ -624,7 +732,10 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     <?php endif; ?>
   </div>
   <div class="card-footer">
-    <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>">⬇</a>
+    <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>">⬇ Film</a>
+    <?php foreach ($subs as $sub): ?>
+    <a class="card-btn card-btn-sub" href="?action=download&amp;file=<?php echo urlencode($sub['rel']); ?>" title="<?php echo h($sub['name']); ?>">💬 <?php echo strtoupper($sub['ext']); ?></a>
+    <?php endforeach; ?>
     <?php if ($tmdb_url): ?>
     <a class="card-btn tmdb" href="<?php echo h($tmdb_url); ?>" target="_blank">TMDB</a>
     <?php endif; ?>
@@ -655,33 +766,10 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 </thead>
 <tbody id="tbody">
 
-<?php if ($cwd_rel !== ''): ?>
-<?php
-  $parent_rel = dirname($cwd_rel);
-  $parent_url = ($parent_rel === '.' || $parent_rel === '') ? '?' : '?dir=' . urlencode($parent_rel);
-?>
-<tr class="folder-row">
-  <td class="col-icon">📁</td>
-  <td class="col-name" colspan="3"><a href="<?php echo $parent_url; ?>">.. (dossier parent)</a></td>
-  <td class="col-actions"></td>
-</tr>
-<?php endif; ?>
-
-<?php foreach ($dirs as $item): ?>
-<tr class="folder-row" data-name="<?php echo h($item['name']); ?>">
-  <td class="col-icon">📁</td>
-  <td class="col-name" data-val="<?php echo h($item['name']); ?>">
-    <a href="?dir=<?php echo urlencode($item['rel']); ?>"><?php echo h($item['name']); ?></a>
-  </td>
-  <td class="col-size" data-val="0">—</td>
-  <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
-  <td class="col-actions"></td>
-</tr>
-<?php endforeach; ?>
-
 <?php foreach ($files as $item):
   $ptype = previewable($item['ext']);
   $m     = isset($meta_all[$item['name']]) ? $meta_all[$item['name']] : null;
+  $subs  = isset($subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))]) ? $subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))] : array();
 ?>
 <tr data-name="<?php echo h($item['name']); ?>">
   <td class="col-icon"><?php echo file_icon($item['ext']); ?></td>
@@ -702,6 +790,9 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
   <td class="col-actions">
     <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>">⬇</a>
+    <?php foreach ($subs as $sub): ?>
+    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($sub['rel']); ?>" title="<?php echo h($sub['name']); ?>">💬</a>
+    <?php endforeach; ?>
     <?php if ($ptype): ?>
     <button class="btn btn-secondary btn-sm"
       onclick="openPreview(<?php echo json_encode($item['rel']); ?>,<?php echo json_encode($item['name']); ?>,<?php echo json_encode($ptype); ?>)">👁</button>
@@ -915,8 +1006,10 @@ function setView(v) {
 setView(currentView);
 
 // ── TMDB sync ──
+var currentDir = <?php echo json_encode($cwd_rel); ?>;
 function fetchOne(filename) {
-  return fetch('?action=fetch_meta&file=' + encodeURIComponent(filename))
+  var dirParam = currentDir ? '&dir=' + encodeURIComponent(currentDir) : '';
+  return fetch('?action=fetch_meta&file=' + encodeURIComponent(filename) + dirParam)
     .then(function(r){ return r.json(); })
     .then(function(data) {
       if (data.ok && data.data) {
