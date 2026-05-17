@@ -1,0 +1,17 @@
+# Secrets — ne jamais commiter
+config.php
+
+# Cache TMDB généré automatiquement à l'exécution
+.movies_meta.json
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+# Fichiers de test créés pendant le développement
+phpver.php
+hashtest.php
+tmdbtest.php
+
+# Anciennes versions
+*.old

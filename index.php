@@ -1,0 +1,1033 @@
+<?php
+/**
+ * SecureFileManager — single-file PHP file manager (PHP 5.6+ compatible)
+ *
+ * Les clés et secrets sont dans config.php (même répertoire).
+ * Voir config.php pour les instructions de configuration.
+ */
+
+// ── Configuration ──────────────────────────────────────────────────────────────
+$config_file = __DIR__ . DIRECTORY_SEPARATOR . 'config.php';
+if (!file_exists($config_file)) {
+    die('Fichier config.php manquant. Créez-le à partir de la documentation fournie.');
+}
+require $config_file;
+
+define('FM_ROOT',          realpath(__DIR__));
+define('FM_TITLE',         'File Manager');
+define('FM_MAX_UPLOAD_MB', 512);
+define('FM_DEMO_MODE',     false);
+define('FM_META_FILE',     FM_ROOT . DIRECTORY_SEPARATOR . '.movies_meta.json');
+define('FM_ALLOWED_EXT',   implode(',', array(
+    'mkv','mp4','avi','mov','wmv','flv','mpg','mpeg','m4v','3gp','ts','webm',
+    'jpg','jpeg','png','gif','webp','svg','ico','bmp',
+    'mp3','aac','wav','flac','ogg','m4a',
+    'pdf','txt','md','nfo','srt','sub','ass','ssa',
+    'zip','rar','7z','tar','gz','bz2','iso',
+)));
+
+ini_set('upload_max_filesize', FM_MAX_UPLOAD_MB . 'M');
+ini_set('post_max_size',       (FM_MAX_UPLOAD_MB + 4) . 'M');
+session_start();
+
+// ── CSRF ───────────────────────────────────────────────────────────────────────
+function csrf_token() {
+    if (empty($_SESSION['csrf'])) {
+        if (function_exists('random_bytes')) {
+            $_SESSION['csrf'] = bin2hex(random_bytes(32));
+        } else {
+            $_SESSION['csrf'] = bin2hex(openssl_random_pseudo_bytes(32));
+        }
+    }
+    return $_SESSION['csrf'];
+}
+function csrf_check() {
+    $token = isset($_POST['_csrf']) ? $_POST['_csrf'] : '';
+    if (!hash_equals(csrf_token(), $token)) {
+        http_response_code(403);
+        die('CSRF validation failed.');
+    }
+}
+
+// ── Auth ───────────────────────────────────────────────────────────────────────
+function authed() { return !empty($_SESSION['fm']); }
+
+$login_error = null;
+if (isset($_POST['_login'])) {
+    csrf_check();
+    $pw = isset($_POST['pw']) ? $_POST['pw'] : '';
+    if (password_verify($pw, FM_PASSWORD_HASH)) {
+        $_SESSION['fm'] = true;
+        $redirect = strtok($_SERVER['REQUEST_URI'], '?');
+        header('Location: ' . $redirect);
+        exit;
+    }
+    $login_error = 'Wrong password.';
+}
+if (isset($_GET['logout'])) {
+    session_destroy();
+    $redirect = strtok($_SERVER['REQUEST_URI'], '?');
+    header('Location: ' . $redirect);
+    exit;
+}
+if (!authed()) { render_login($login_error); exit; }
+
+// ── Path safety ────────────────────────────────────────────────────────────────
+function jail($rel) {
+    $abs = realpath(FM_ROOT . DIRECTORY_SEPARATOR . ltrim($rel, '/\\'));
+    if ($abs === false || strncmp($abs, FM_ROOT, strlen(FM_ROOT)) !== 0) return false;
+    return $abs;
+}
+function jail_new($rel) {
+    $raw   = FM_ROOT . DIRECTORY_SEPARATOR . ltrim($rel, '/\\');
+    $parts = array();
+    foreach (explode(DIRECTORY_SEPARATOR, str_replace(array('/', '\\'), DIRECTORY_SEPARATOR, $raw)) as $p) {
+        if ($p === '..') { array_pop($parts); }
+        elseif ($p !== '.' && $p !== '') { $parts[] = $p; }
+    }
+    $abs = implode(DIRECTORY_SEPARATOR, $parts);
+    if (strncmp($abs, FM_ROOT, strlen(FM_ROOT)) !== 0) return false;
+    return $abs;
+}
+function relpath($abs) {
+    return ltrim(substr($abs, strlen(FM_ROOT)), DIRECTORY_SEPARATOR);
+}
+function current_dir() {
+    $dir = isset($_GET['dir']) ? $_GET['dir'] : '';
+    $abs = jail($dir);
+    if ($abs === false || !is_dir($abs)) return FM_ROOT;
+    return $abs;
+}
+
+// ── File helpers ───────────────────────────────────────────────────────────────
+function fmt_size($bytes) {
+    // Use float to handle large files correctly on 32-bit PHP
+    $b = (float)sprintf('%u', (int)$bytes);
+    if ($b >= 1073741824) return round($b / 1073741824, 2) . ' GB';
+    if ($b >= 1048576)    return round($b / 1048576, 1)    . ' MB';
+    if ($b >= 1024)       return round($b / 1024, 1)       . ' KB';
+    return $b . ' B';
+}
+function file_icon($ext) {
+    $map = array(
+        'mkv'=>'🎬','mp4'=>'🎬','avi'=>'🎬','mov'=>'🎬','wmv'=>'🎬','flv'=>'🎬',
+        'mpg'=>'🎬','mpeg'=>'🎬','m4v'=>'🎬','webm'=>'🎬','ts'=>'🎬','3gp'=>'🎬',
+        'mp3'=>'🎵','aac'=>'🎵','wav'=>'🎵','flac'=>'🎵','ogg'=>'🎵','m4a'=>'🎵',
+        'jpg'=>'🖼','jpeg'=>'🖼','png'=>'🖼','gif'=>'🖼','webp'=>'🖼','svg'=>'🖼',
+        'pdf'=>'📕','txt'=>'📝','md'=>'📝','nfo'=>'📝','srt'=>'📝','ass'=>'📝',
+        'zip'=>'📦','rar'=>'📦','7z'=>'📦','tar'=>'📦','gz'=>'📦','bz2'=>'📦','iso'=>'📀',
+    );
+    return isset($map[$ext]) ? $map[$ext] : '📄';
+}
+function previewable($ext) {
+    if (in_array($ext, array('jpg','jpeg','png','gif','webp','svg'), true)) return 'image';
+    if (in_array($ext, array('mp4','webm','mkv','m4v'), true))             return 'video';
+    if (in_array($ext, array('mp3','ogg','wav','aac','flac','m4a'), true)) return 'audio';
+    if (in_array($ext, array('txt','md','nfo','srt','sub','ass','ssa'), true)) return 'text';
+    if ($ext === 'pdf') return 'pdf';
+    return '';
+}
+function breadcrumbs($rel) {
+    $parts = array_values(array_filter(explode('/', $rel), function($p) { return $p !== ''; }));
+    $html  = '<a href="?">🏠</a>';
+    $path  = '';
+    foreach ($parts as $p) {
+        $path .= '/' . $p;
+        $html .= ' <span class="sep">/</span> <a href="?dir=' . urlencode(ltrim($path, '/')) . '">' . h($p) . '</a>';
+    }
+    return $html;
+}
+function h($s) { return htmlspecialchars($s, ENT_QUOTES, 'UTF-8'); }
+function safe_filename($name) {
+    return preg_replace('/[^A-Za-z0-9._\-\(\) \[\]]/', '_', $name);
+}
+
+// ── Movie metadata ─────────────────────────────────────────────────────────────
+function meta_load() {
+    $f = FM_META_FILE;
+    if (!file_exists($f)) return array();
+    $data = json_decode(file_get_contents($f), true);
+    return is_array($data) ? $data : array();
+}
+function meta_save($data) {
+    file_put_contents(FM_META_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+}
+function parse_movie_name($filename) {
+    // Remove extension
+    $name = pathinfo($filename, PATHINFO_FILENAME);
+    // Extract year like (2017) or .2017.
+    $year = null;
+    if (preg_match('/[\(\.\s](\d{4})[\)\.\s]/', $name, $m)) {
+        $year = (int)$m[1];
+    }
+    // Remove quality/source tags and year
+    $title = preg_replace('/[\(\[\.\s](19|20)\d{2}[\)\]\.\s].*$/i', '', $name);
+    $title = preg_replace('/[\[\(](blu.?ray|bdrip|dvdrip|webrip|web.?dl|hdtv|hdrip|xvid|divx|x264|x265|hevc|aac|ac3|dts|multi|vf|vff|vostfr|truefrench)[^\)]*[\]\)]/i', '', $title);
+    $title = preg_replace('/\.(blu.?ray|dvdrip|bdrip|webrip|web.?dl|hdtv|1080p|720p|480p|2160p|4k|xvid|x264|x265|hevc).*/i', '', $title);
+    // Replace dots and underscores with spaces
+    $title = str_replace(array('.', '_'), ' ', $title);
+    // Insert spaces before uppercase letters (CamelCase)
+    $title = preg_replace('/([a-z])([A-Z])/', '$1 $2', $title);
+    $title = trim($title);
+    return array('title' => $title, 'year' => $year);
+}
+function tmdb_fetch($title, $year = null) {
+    if (!FM_TMDB_API_KEY) return null;
+    $query = urlencode($title);
+    $url   = 'https://api.themoviedb.org/3/search/movie'
+           . '?query=' . $query
+           . '&language=' . FM_TMDB_LANG
+           . ($year ? '&year=' . $year : '');
+    $ctx  = stream_context_create(array('http' => array(
+        'timeout' => 8,
+        'ignore_errors' => true,
+        'header' => 'Authorization: Bearer ' . FM_TMDB_API_KEY . "\r\n"
+                  . 'Accept: application/json' . "\r\n",
+    )));
+    $resp = @file_get_contents($url, false, $ctx);
+    if (!$resp) return null;
+    $data = json_decode($resp, true);
+    if (empty($data['results'])) {
+        if ($year) return tmdb_fetch($title, null);
+        return null;
+    }
+    $m = $data['results'][0];
+    return array(
+        'tmdb_id'     => $m['id'],
+        'title'       => isset($m['title'])          ? $m['title']          : $title,
+        'orig_title'  => isset($m['original_title']) ? $m['original_title'] : '',
+        'year'        => isset($m['release_date'])   ? (int)substr($m['release_date'], 0, 4) : $year,
+        'poster_path' => isset($m['poster_path'])    ? $m['poster_path']    : '',
+        'rating'      => isset($m['vote_average'])   ? round($m['vote_average'], 1) : null,
+        'votes'       => isset($m['vote_count'])     ? $m['vote_count']     : 0,
+        'overview'    => isset($m['overview'])       ? $m['overview']       : '',
+        'fetched_at'  => time(),
+    );
+}
+function star_html($rating) {
+    if ($rating === null) return '<span class="no-rating">—</span>';
+    $pct = round(($rating / 10) * 100);
+    return '<span class="stars" title="' . $rating . '/10">'
+         . '<span class="stars-fill" style="width:' . $pct . '%">★★★★★</span>'
+         . '<span class="stars-bg">★★★★★</span>'
+         . '</span> <span class="rating-num">' . $rating . '</span>';
+}
+
+// ── Actions (POST) ─────────────────────────────────────────────────────────────
+$msg = $err = '';
+$action = isset($_POST['action']) ? $_POST['action'] : '';
+
+// ── Download / Preview (GET) ──
+$get_action = isset($_GET['action']) ? $_GET['action'] : '';
+if ($get_action === 'download') {
+    $f = jail(isset($_GET['file']) ? $_GET['file'] : '');
+    if ($f && is_file($f)) {
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . addslashes(basename($f)) . '"');
+        header('Content-Length: ' . filesize($f));
+        header('Cache-Control: no-cache');
+        readfile($f); exit;
+    }
+    http_response_code(404); exit;
+}
+if ($get_action === 'preview') {
+    $f = jail(isset($_GET['file']) ? $_GET['file'] : '');
+    if ($f && is_file($f)) {
+        $ext  = strtolower(pathinfo($f, PATHINFO_EXTENSION));
+        $mime_map = array(
+            'jpg'=>'image/jpeg','jpeg'=>'image/jpeg','png'=>'image/png','gif'=>'image/gif',
+            'webp'=>'image/webp','svg'=>'image/svg+xml',
+            'mp4'=>'video/mp4','webm'=>'video/webm','mkv'=>'video/x-matroska','m4v'=>'video/mp4',
+            'mp3'=>'audio/mpeg','ogg'=>'audio/ogg','wav'=>'audio/wav',
+            'aac'=>'audio/aac','flac'=>'audio/flac','m4a'=>'audio/mp4',
+            'txt'=>'text/plain','md'=>'text/plain','nfo'=>'text/plain',
+            'srt'=>'text/plain','sub'=>'text/plain','ass'=>'text/plain','ssa'=>'text/plain',
+            'pdf'=>'application/pdf',
+        );
+        $mime = isset($mime_map[$ext]) ? $mime_map[$ext] : 'application/octet-stream';
+        header('Content-Type: ' . $mime);
+        header('Content-Length: ' . filesize($f));
+        header('Cache-Control: max-age=3600');
+        readfile($f); exit;
+    }
+    http_response_code(404); exit;
+}
+
+// ── TMDB metadata fetch (AJAX, GET) ───────────────────────────────────────────
+if ($get_action === 'fetch_meta') {
+    header('Content-Type: application/json');
+    if (!FM_TMDB_API_KEY) { echo json_encode(array('error' => 'No API key')); exit; }
+    $filename = isset($_GET['file']) ? basename($_GET['file']) : '';
+    if (!$filename) { echo json_encode(array('error' => 'No file')); exit; }
+    $meta  = meta_load();
+    $parsed = parse_movie_name($filename);
+    $result = tmdb_fetch($parsed['title'], $parsed['year']);
+    if ($result) {
+        $meta[$filename] = $result;
+        meta_save($meta);
+        echo json_encode(array('ok' => true, 'data' => $result));
+    } else {
+        // Store a placeholder so we don't re-fetch endlessly
+        $meta[$filename] = array('not_found' => true, 'fetched_at' => time());
+        meta_save($meta);
+        echo json_encode(array('ok' => false, 'error' => 'Not found on TMDB'));
+    }
+    exit;
+}
+
+// ── Delete meta entry (AJAX, GET) ─────────────────────────────────────────────
+if ($get_action === 'delete_meta') {
+    header('Content-Type: application/json');
+    $filename = isset($_GET['file']) ? basename($_GET['file']) : '';
+    if ($filename) {
+        $meta = meta_load();
+        unset($meta[$filename]);
+        meta_save($meta);
+    }
+    echo json_encode(array('ok' => true)); exit;
+}
+
+if (!FM_DEMO_MODE && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check();
+    $cwd     = current_dir();
+    $cwd_rel = relpath($cwd);
+
+    if ($action === 'upload') {
+        $allowed  = array_map('trim', explode(',', FM_ALLOWED_EXT));
+        $ok = 0; $errs = array();
+        $names = isset($_FILES['files']['name']) ? $_FILES['files']['name'] : array();
+        foreach ($names as $i => $orig) {
+            if ($_FILES['files']['error'][$i] !== UPLOAD_ERR_OK) {
+                $errs[] = h($orig) . ': upload error';
+                continue;
+            }
+            $ext = strtolower(pathinfo($orig, PATHINFO_EXTENSION));
+            if (!in_array($ext, $allowed, true)) {
+                $errs[] = h($orig) . ': extension .' . h($ext) . ' not allowed';
+                continue;
+            }
+            $safe = safe_filename($orig);
+            $dest = jail_new(($cwd_rel ? $cwd_rel . '/' : '') . $safe);
+            if (!$dest) { $errs[] = h($orig) . ': invalid path'; continue; }
+            if (move_uploaded_file($_FILES['files']['tmp_name'][$i], $dest)) $ok++;
+            else $errs[] = h($orig) . ': could not save';
+        }
+        $msg = "$ok file(s) uploaded.";
+        if ($errs) $err = implode('<br>', $errs);
+    }
+
+    if ($action === 'mkdir') {
+        $name = safe_filename(trim(isset($_POST['name']) ? $_POST['name'] : ''));
+        if ($name === '') { $err = 'Invalid folder name.'; }
+        else {
+            $dest = jail_new(($cwd_rel ? $cwd_rel . '/' : '') . $name);
+            if (!$dest)             $err = 'Invalid path.';
+            elseif (file_exists($dest)) $err = 'Already exists.';
+            else { mkdir($dest, 0755); $msg = "Folder '$name' created."; }
+        }
+    }
+
+    if ($action === 'delete') {
+        $target = jail(isset($_POST['target']) ? $_POST['target'] : '');
+        if (!$target || $target === FM_ROOT) { $err = 'Invalid target.'; }
+        elseif (is_file($target)) { unlink($target); $msg = 'File deleted.'; }
+        elseif (is_dir($target)) {
+            $items = array_diff(scandir($target), array('.', '..'));
+            if (count($items) > 0) $err = 'Folder is not empty.';
+            else { rmdir($target); $msg = 'Folder deleted.'; }
+        } else $err = 'Not found.';
+    }
+
+    if ($action === 'rename') {
+        $src      = jail(isset($_POST['source'])   ? $_POST['source']   : '');
+        $new_name = safe_filename(trim(isset($_POST['new_name']) ? $_POST['new_name'] : ''));
+        if (!$src || $new_name === '') { $err = 'Invalid input.'; }
+        else {
+            $dest = jail_new(relpath(dirname($src)) . '/' . $new_name);
+            if (!$dest)             $err = 'Invalid destination.';
+            elseif (file_exists($dest)) $err = 'Name already in use.';
+            else { rename($src, $dest); $msg = 'Renamed to ' . h($new_name) . '.'; }
+        }
+    }
+}
+
+// ── Scan directory ─────────────────────────────────────────────────────────────
+$meta_all = meta_load();
+$cwd     = current_dir();
+$cwd_rel = relpath($cwd);
+$ignore  = array('.', '..', basename(__FILE__), '.DS_Store', 'Thumbs.db',
+                 '.movies_meta.json', '.@__thumb', '.@__qini', '@Transcode', '.deletedByTMM',
+                 'listr.css', 'listr-favicon.png', 'index.php_old', 'filemanager.php');
+$video_ext = array('mkv','mp4','avi','mov','wmv','flv','mpg','mpeg','m4v','3gp','ts','webm','divx','xvid');
+$dirs = $files = array();
+$total_bytes = 0;
+
+if ($dh = opendir($cwd)) {
+    while (($e = readdir($dh)) !== false) {
+        if (in_array($e, $ignore, true)) continue;
+        $abs  = $cwd . DIRECTORY_SEPARATOR . $e;
+        $stat = @stat($abs);
+        $rel  = ($cwd_rel ? $cwd_rel . '/' : '') . $e;
+        $item = array(
+            'name'  => $e,
+            'rel'   => $rel,
+            'mtime' => ($stat && isset($stat['mtime'])) ? $stat['mtime'] : 0,
+            'bytes' => ($stat && isset($stat['size']))  ? sprintf('%u', $stat['size']) : 0,
+            'ext'   => strtolower(pathinfo($e, PATHINFO_EXTENSION)),
+        );
+        if (is_dir($abs)) $dirs[] = $item;
+        else { $total_bytes += (float)sprintf('%u', $item['bytes']); $files[] = $item; }
+    }
+    closedir($dh);
+}
+usort($dirs,  function($a, $b) { return strcasecmp($a['name'], $b['name']); });
+usort($files, function($a, $b) { return $b['mtime'] - $a['mtime']; });
+
+$dir_url = $cwd_rel ? '?dir=' . urlencode($cwd_rel) : '?';
+
+// ── Login page ─────────────────────────────────────────────────────────────────
+function render_login($err) { ?>
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login – <?php echo FM_TITLE; ?></title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh;
+     background:#111827;font-family:system-ui,sans-serif}
+.card{background:#1f2937;color:#f9fafb;padding:2.5rem;border-radius:12px;
+      width:340px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+h1{font-size:1.5rem;margin-bottom:1.75rem;text-align:center}
+label{display:block;font-size:.82rem;color:#9ca3af;margin-bottom:.35rem}
+input[type=password]{width:100%;padding:.65rem .9rem;background:#111827;
+  border:1px solid #374151;border-radius:6px;color:#f9fafb;font-size:1rem;
+  margin-bottom:1.2rem;outline:none}
+button{width:100%;padding:.75rem;background:#6366f1;border:none;border-radius:6px;
+       color:#fff;font-size:1rem;cursor:pointer;font-weight:600}
+button:hover{background:#4f46e5}
+.err{color:#f87171;font-size:.83rem;margin-bottom:1rem;text-align:center}
+</style></head><body>
+<div class="card">
+  <h1>🗂 <?php echo FM_TITLE; ?></h1>
+  <?php if ($err): ?><p class="err"><?php echo h($err); ?></p><?php endif; ?>
+  <form method="post">
+    <input type="hidden" name="_csrf"  value="<?php echo csrf_token(); ?>">
+    <input type="hidden" name="_login" value="1">
+    <label for="pw">Password</label>
+    <input type="password" id="pw" name="pw" autofocus required autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+</div></body></html>
+<?php }
+
+// ── Main page ──────────────────────────────────────────────────────────────────
+?><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title><?php echo FM_TITLE; ?> — /<?php echo h($cwd_rel); ?></title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111827;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif;font-size:.92rem}
+a{color:#818cf8;text-decoration:none}a:hover{text-decoration:underline}
+#app{display:flex;flex-direction:column;min-height:100vh}
+#topbar{background:#1f2937;border-bottom:1px solid #374151;
+        padding:.65rem 1.2rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}
+#topbar h1{font-size:1.05rem;font-weight:700;color:#a5b4fc;white-space:nowrap}
+#breadcrumbs{flex:1;font-size:.85rem;color:#9ca3af;min-width:0;overflow:hidden;
+             text-overflow:ellipsis;white-space:nowrap}
+#breadcrumbs a{color:#c4b5fd}
+#breadcrumbs .sep{color:#4b5563}
+#topbar input[type=search]{background:#111827;border:1px solid #374151;border-radius:6px;
+  padding:.45rem .75rem;color:#e5e7eb;width:180px;outline:none;font-size:.85rem}
+#topbar a.btn-logout{background:#374151;color:#e5e7eb;padding:.45rem .85rem;
+  border-radius:6px;font-size:.82rem;white-space:nowrap}
+#topbar a.btn-logout:hover{background:#4b5563;text-decoration:none}
+#toolbar{padding:.6rem 1.2rem;display:flex;gap:.5rem;flex-wrap:wrap;
+         background:#1a2332;border-bottom:1px solid #374151;align-items:center}
+.btn{display:inline-flex;align-items:center;gap:.35rem;padding:.45rem .9rem;
+     border:none;border-radius:6px;cursor:pointer;font-size:.84rem;font-weight:500;
+     text-decoration:none;white-space:nowrap}
+.btn-primary{background:#6366f1;color:#fff}.btn-primary:hover{background:#4f46e5}
+.btn-secondary{background:#374151;color:#e5e7eb}.btn-secondary:hover{background:#4b5563}
+.btn-danger{background:#991b1b;color:#fca5a5}.btn-danger:hover{background:#7f1d1d}
+.btn-sm{padding:.3rem .65rem;font-size:.78rem}
+#messages{padding:.55rem 1.2rem}
+.msg{padding:.55rem 1rem;border-radius:6px;font-size:.85rem;margin-bottom:.4rem}
+.msg-ok{background:#14532d;color:#86efac}
+.msg-err{background:#7f1d1d;color:#fca5a5}
+#file-table-wrap{padding:0 1.2rem 1.2rem;overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+thead th{padding:.55rem .75rem;text-align:left;font-size:.78rem;text-transform:uppercase;
+         letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #374151;
+         cursor:pointer;user-select:none;white-space:nowrap}
+thead th:hover{color:#e5e7eb}
+tbody tr{border-bottom:1px solid #1f2937}
+tbody tr:hover{background:#1e2939}
+td{padding:.5rem .75rem;vertical-align:middle}
+.col-icon{width:2rem;font-size:1.15rem}
+.col-name{word-break:break-all}
+.col-size,.col-date{white-space:nowrap;color:#9ca3af;text-align:right;font-size:.83rem}
+.col-actions{white-space:nowrap;text-align:right}
+.folder-row td.col-name a{color:#fbbf24;font-weight:500}
+.row-hidden{display:none!important}
+th .si{margin-left:.25rem;opacity:.4}
+th.sorted-asc .si::after{content:'↑';opacity:1}
+th.sorted-desc .si::after{content:'↓';opacity:1}
+.modal-bg{display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+          background:rgba(0,0,0,.6);z-index:1000;align-items:center;justify-content:center}
+.modal-bg.open{display:flex}
+.modal{background:#1f2937;border-radius:12px;padding:1.75rem;width:90%;max-width:520px;
+       box-shadow:0 20px 60px rgba(0,0,0,.6);max-height:90vh;display:flex;flex-direction:column}
+.modal h2{margin-bottom:1rem;font-size:1.1rem}
+.modal-body{flex:1;overflow:auto}
+.modal-footer{margin-top:1rem;display:flex;gap:.5rem;justify-content:flex-end}
+.fm-label{display:block;font-size:.82rem;color:#9ca3af;margin-bottom:.35rem;margin-top:.75rem}
+.fm-label:first-child{margin-top:0}
+.fm-input{width:100%;padding:.55rem .8rem;background:#111827;
+  border:1px solid #374151;border-radius:6px;color:#e5e7eb;font-size:.9rem}
+#drop-zone{border:2px dashed #374151;border-radius:8px;padding:2rem;text-align:center;
+           color:#6b7280;cursor:pointer;margin-bottom:1rem}
+#drop-zone.drag-over{border-color:#6366f1;color:#a5b4fc}
+#drop-zone p{margin:.4rem 0;font-size:.85rem}
+#file-list-preview{list-style:none;padding:0;font-size:.82rem;color:#9ca3af;max-height:150px;overflow:auto}
+#file-list-preview li{padding:.2rem 0;border-bottom:1px solid #1f2937}
+#preview-modal .modal{max-width:900px}
+#preview-container{text-align:center}
+#preview-container img{max-width:100%;max-height:72vh;border-radius:6px}
+#preview-container video,#preview-container audio{max-width:100%}
+#preview-container pre{text-align:left;background:#111827;padding:1rem;border-radius:6px;
+  overflow:auto;max-height:65vh;font-size:.82rem;color:#d1fae5;white-space:pre-wrap}
+#preview-container iframe{width:100%;height:70vh;border:none;border-radius:6px}
+.empty{padding:3rem;text-align:center;color:#4b5563}
+.empty span{font-size:2.5rem;display:block;margin-bottom:.75rem}
+#footer{padding:.6rem 1.2rem;font-size:.78rem;color:#4b5563;
+        border-top:1px solid #1f2937;display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
+@media(max-width:600px){.col-date{display:none}#topbar input[type=search]{width:130px}}
+/* ── Card grid ── */
+#card-grid{display:none;padding:1rem 1.2rem;
+  display:none;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1.2rem}
+#card-grid.active{display:grid}
+#file-table-wrap.hidden{display:none}
+.card{background:#1f2937;border-radius:10px;overflow:hidden;
+      display:flex;flex-direction:column;transition:.2s;position:relative}
+.card:hover{transform:translateY(-3px);box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.card-poster{width:100%;aspect-ratio:2/3;object-fit:cover;display:block;background:#111827}
+.card-poster-placeholder{width:100%;aspect-ratio:2/3;background:#111827;
+  display:flex;align-items:center;justify-content:center;font-size:3rem}
+.card-body{padding:.75rem;flex:1;display:flex;flex-direction:column;gap:.3rem}
+.card-title{font-weight:600;font-size:.88rem;line-height:1.3;color:#f9fafb}
+.card-year{font-size:.75rem;color:#6b7280}
+.card-rating{font-size:.8rem}
+.card-overview{font-size:.75rem;color:#9ca3af;line-height:1.4;
+               overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+.card-footer{padding:.5rem .75rem;display:flex;gap:.4rem;flex-wrap:wrap;
+             border-top:1px solid #374151;margin-top:auto}
+.card-btn{font-size:.72rem;padding:.25rem .55rem;border-radius:4px;text-decoration:none;
+          background:#374151;color:#e5e7eb;border:none;cursor:pointer;white-space:nowrap}
+.card-btn:hover{background:#4b5563;text-decoration:none}
+.card-btn.tmdb{background:#01b4e4;color:#fff}.card-btn.tmdb:hover{background:#0099c7}
+.card-btn.allocine{background:#feb800;color:#000}.card-btn.allocine:hover{background:#d9a000}
+.card-fetching{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
+               background:#6366f1;color:#fff;padding:.15rem .4rem;border-radius:4px}
+.card-not-found{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
+                background:#374151;color:#9ca3af;padding:.15rem .4rem;border-radius:4px}
+/* Stars */
+.stars{position:relative;display:inline-block;font-size:.9rem;line-height:1}
+.stars-bg{color:#374151}
+.stars-fill{position:absolute;top:0;left:0;overflow:hidden;white-space:nowrap;color:#fbbf24}
+.rating-num{font-size:.78rem;color:#9ca3af;margin-left:.2rem}
+.no-rating{color:#4b5563;font-size:.78rem}
+/* Sync progress */
+#sync-bar{display:none;padding:.4rem 1.2rem;background:#1e1b4b;font-size:.82rem;color:#a5b4fc;
+          border-bottom:1px solid #374151}
+#sync-bar.active{display:block}
+.btn-active{background:#4f46e5!important}
+</style>
+</head>
+<body>
+<div id="app">
+
+<div id="topbar">
+  <h1>🗂 <?php echo FM_TITLE; ?></h1>
+  <div id="breadcrumbs"><?php echo breadcrumbs($cwd_rel); ?></div>
+  <input type="search" id="search" placeholder="Filter…" oninput="filterRows(this.value)" autocomplete="off">
+  <a class="btn-logout" href="?logout=1">Sign out</a>
+</div>
+
+<div id="toolbar">
+  <?php if (!FM_DEMO_MODE): ?>
+  <button class="btn btn-primary" onclick="openModal('upload-modal')">⬆ Upload</button>
+  <button class="btn btn-secondary" onclick="openModal('mkdir-modal')">📁 New folder</button>
+  <?php endif; ?>
+  <?php if (FM_TMDB_API_KEY): ?>
+  <button class="btn btn-secondary" id="btn-sync" onclick="startSync()">🎬 Sync métadonnées</button>
+  <?php endif; ?>
+  <span style="flex:1"></span>
+  <button class="btn btn-secondary" id="btn-list" onclick="setView('list')" title="Vue liste">☰ Liste</button>
+  <button class="btn btn-secondary" id="btn-grid" onclick="setView('grid')" title="Vue grille">⊞ Grille</button>
+  <span style="color:#6b7280;font-size:.82rem">
+    <?php echo count($dirs); ?> dossier<?php echo count($dirs) != 1 ? 's' : ''; ?>,
+    <?php echo count($files); ?> film<?php echo count($files) != 1 ? 's' : ''; ?>
+    <?php echo count($files) ? ' — ' . fmt_size($total_bytes) : ''; ?>
+  </span>
+</div>
+
+<div id="sync-bar">⏳ Synchronisation en cours… <span id="sync-progress"></span></div>
+
+<?php if ($msg || $err): ?>
+<div id="messages">
+  <?php if ($msg): ?><div class="msg msg-ok">✓ <?php echo h($msg); ?></div><?php endif; ?>
+  <?php if ($err): ?><div class="msg msg-err">✗ <?php echo $err; ?></div><?php endif; ?>
+</div>
+<?php endif; ?>
+
+
+<!-- ── Card grid (sibling of file-table-wrap, not inside) ── -->
+<div id="card-grid">
+<?php if (!empty($files)): ?>
+<?php foreach ($files as $item):
+  $m      = isset($meta_all[$item['name']]) ? $meta_all[$item['name']] : null;
+  $is_vid = in_array($item['ext'], $video_ext, true);
+  if (!$is_vid) continue;
+  $poster = ($m && !empty($m['poster_path']))
+          ? 'https://image.tmdb.org/t/p/w300' . $m['poster_path']
+          : '';
+  $tmdb_url    = ($m && !empty($m['tmdb_id']))
+               ? 'https://www.themoviedb.org/movie/' . $m['tmdb_id']
+               : '';
+  $alloc_title = ($m && !empty($m['title'])) ? $m['title'] : pathinfo($item['name'], PATHINFO_FILENAME);
+  $alloc_url   = 'https://www.allocine.fr/rechercher/movie/?q=' . urlencode($alloc_title);
+  $not_found   = ($m && !empty($m['not_found']));
+?>
+<div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>">
+  <?php if ($poster): ?>
+    <img class="card-poster" src="<?php echo h($poster); ?>" alt="" loading="lazy">
+  <?php else: ?>
+    <div class="card-poster-placeholder">🎬</div>
+  <?php endif; ?>
+  <?php if ($not_found): ?>
+    <span class="card-not-found" title="Non trouvé sur TMDB">?</span>
+  <?php endif; ?>
+  <div class="card-body">
+    <div class="card-title"><?php echo $m && !empty($m['title']) ? h($m['title']) : h(pathinfo($item['name'], PATHINFO_FILENAME)); ?></div>
+    <?php if ($m && !empty($m['year'])): ?>
+    <div class="card-year"><?php echo (int)$m['year']; ?> — <?php echo fmt_size($item['bytes']); ?></div>
+    <?php else: ?>
+    <div class="card-year"><?php echo fmt_size($item['bytes']); ?></div>
+    <?php endif; ?>
+    <?php if ($m && isset($m['rating'])): ?>
+    <div class="card-rating"><?php echo star_html($m['rating']); ?></div>
+    <?php endif; ?>
+    <?php if ($m && !empty($m['overview'])): ?>
+    <div class="card-overview"><?php echo h($m['overview']); ?></div>
+    <?php endif; ?>
+  </div>
+  <div class="card-footer">
+    <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>">⬇</a>
+    <?php if ($tmdb_url): ?>
+    <a class="card-btn tmdb" href="<?php echo h($tmdb_url); ?>" target="_blank">TMDB</a>
+    <?php endif; ?>
+    <a class="card-btn allocine" href="<?php echo h($alloc_url); ?>" target="_blank">Allociné</a>
+    <?php if (FM_TMDB_API_KEY): ?>
+    <button class="card-btn" onclick="fetchOne(<?php echo json_encode($item['name']); ?>)" title="Re-chercher sur TMDB">↺</button>
+    <?php endif; ?>
+  </div>
+</div>
+<?php endforeach; ?>
+<?php endif; ?>
+</div>
+
+<div id="file-table-wrap">
+<?php if (empty($dirs) && empty($files)): ?>
+  <div class="empty"><span>🌑</span>This folder is empty.</div>
+<?php else: ?>
+
+<table id="ftable">
+<thead>
+  <tr>
+    <th class="col-icon"></th>
+    <th class="col-name"    onclick="sortTable(this,1)">Nom <span class="si"></span></th>
+    <th class="col-size"    onclick="sortTable(this,2)">Taille <span class="si"></span></th>
+    <th class="col-date"    onclick="sortTable(this,3)">Date <span class="si"></span></th>
+    <th class="col-actions">Actions</th>
+  </tr>
+</thead>
+<tbody id="tbody">
+
+<?php if ($cwd_rel !== ''): ?>
+<?php
+  $parent_rel = dirname($cwd_rel);
+  $parent_url = ($parent_rel === '.' || $parent_rel === '') ? '?' : '?dir=' . urlencode($parent_rel);
+?>
+<tr class="folder-row">
+  <td class="col-icon">📁</td>
+  <td class="col-name" colspan="3"><a href="<?php echo $parent_url; ?>">.. (dossier parent)</a></td>
+  <td class="col-actions"></td>
+</tr>
+<?php endif; ?>
+
+<?php foreach ($dirs as $item): ?>
+<tr class="folder-row" data-name="<?php echo h($item['name']); ?>">
+  <td class="col-icon">📁</td>
+  <td class="col-name" data-val="<?php echo h($item['name']); ?>">
+    <a href="?dir=<?php echo urlencode($item['rel']); ?>"><?php echo h($item['name']); ?></a>
+  </td>
+  <td class="col-size" data-val="0">—</td>
+  <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
+  <td class="col-actions"></td>
+</tr>
+<?php endforeach; ?>
+
+<?php foreach ($files as $item):
+  $ptype = previewable($item['ext']);
+  $m     = isset($meta_all[$item['name']]) ? $meta_all[$item['name']] : null;
+?>
+<tr data-name="<?php echo h($item['name']); ?>">
+  <td class="col-icon"><?php echo file_icon($item['ext']); ?></td>
+  <td class="col-name" data-val="<?php echo h($item['name']); ?>">
+    <?php if ($ptype): ?>
+      <a href="#" onclick="openPreview(<?php echo json_encode($item['rel']); ?>,<?php echo json_encode($item['name']); ?>,<?php echo json_encode($ptype); ?>);return false"><?php echo h($item['name']); ?></a>
+    <?php else: ?>
+      <a href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>"><?php echo h($item['name']); ?></a>
+    <?php endif; ?>
+    <?php if ($m && !empty($m['title'])): ?>
+      <br><small style="color:#9ca3af"><?php echo h($m['title']); ?>
+      <?php if (!empty($m['year'])): ?>(<?php echo (int)$m['year']; ?>)<?php endif; ?>
+      <?php if (isset($m['rating'])): ?>— <?php echo $m['rating']; ?>/10<?php endif; ?>
+      </small>
+    <?php endif; ?>
+  </td>
+  <td class="col-size" data-val="<?php echo $item['bytes']; ?>"><?php echo fmt_size($item['bytes']); ?></td>
+  <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
+  <td class="col-actions">
+    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>">⬇</a>
+    <?php if ($ptype): ?>
+    <button class="btn btn-secondary btn-sm"
+      onclick="openPreview(<?php echo json_encode($item['rel']); ?>,<?php echo json_encode($item['name']); ?>,<?php echo json_encode($ptype); ?>)">👁</button>
+    <?php endif; ?>
+  </td>
+</tr>
+<?php endforeach; ?>
+
+</tbody>
+</table>
+<?php endif; ?>
+</div>
+
+<div id="footer">
+  <span>SecureFileManager<?php echo FM_DEMO_MODE ? ' — <em>Read-only mode</em>' : ''; ?></span>
+  <span><?php echo h($cwd_rel ? $cwd_rel : '/'); ?></span>
+</div>
+</div>
+
+<!-- Upload modal -->
+<div class="modal-bg" id="upload-modal">
+<div class="modal">
+  <h2>⬆ Upload files</h2>
+  <form method="post" enctype="multipart/form-data" action="<?php echo $dir_url; ?>">
+    <input type="hidden" name="_csrf"  value="<?php echo csrf_token(); ?>">
+    <input type="hidden" name="action" value="upload">
+    <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+      <p style="font-size:2rem">📂</p>
+      <p>Drop files here or <strong style="color:#818cf8">click to browse</strong></p>
+      <p>Max <?php echo FM_MAX_UPLOAD_MB; ?> MB per file &mdash; allowed: <?php echo FM_ALLOWED_EXT; ?></p>
+    </div>
+    <input type="file" id="file-input" name="files[]" multiple style="display:none">
+    <ul id="file-list-preview"></ul>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal('upload-modal')">Cancel</button>
+      <button type="submit" class="btn btn-primary">Upload</button>
+    </div>
+  </form>
+</div>
+</div>
+
+<!-- New folder modal -->
+<div class="modal-bg" id="mkdir-modal">
+<div class="modal">
+  <h2>📁 New folder</h2>
+  <form method="post" action="<?php echo $dir_url; ?>">
+    <input type="hidden" name="_csrf"  value="<?php echo csrf_token(); ?>">
+    <input type="hidden" name="action" value="mkdir">
+    <label class="fm-label" for="mkdir-name">Folder name</label>
+    <input class="fm-input" type="text" id="mkdir-name" name="name" required autofocus>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal('mkdir-modal')">Cancel</button>
+      <button type="submit" class="btn btn-primary">Create</button>
+    </div>
+  </form>
+</div>
+</div>
+
+<!-- Rename modal -->
+<div class="modal-bg" id="rename-modal">
+<div class="modal">
+  <h2>✏ Rename</h2>
+  <form method="post" action="<?php echo $dir_url; ?>">
+    <input type="hidden" name="_csrf"    value="<?php echo csrf_token(); ?>">
+    <input type="hidden" name="action"   value="rename">
+    <input type="hidden" name="source"   id="rename-source">
+    <label class="fm-label" for="rename-name">New name</label>
+    <input class="fm-input" type="text" id="rename-name" name="new_name" required>
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal('rename-modal')">Cancel</button>
+      <button type="submit" class="btn btn-primary">Rename</button>
+    </div>
+  </form>
+</div>
+</div>
+
+<!-- Delete modal -->
+<div class="modal-bg" id="delete-modal">
+<div class="modal">
+  <h2>🗑 Confirm delete</h2>
+  <p id="delete-msg" style="color:#fca5a5;margin-bottom:.5rem"></p>
+  <p style="font-size:.82rem;color:#9ca3af">This action cannot be undone.</p>
+  <form method="post" action="<?php echo $dir_url; ?>">
+    <input type="hidden" name="_csrf"   value="<?php echo csrf_token(); ?>">
+    <input type="hidden" name="action"  value="delete">
+    <input type="hidden" name="target"  id="delete-target">
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" onclick="closeModal('delete-modal')">Cancel</button>
+      <button type="submit" class="btn btn-danger">Delete</button>
+    </div>
+  </form>
+</div>
+</div>
+
+<!-- Preview modal -->
+<div class="modal-bg" id="preview-modal" onclick="if(event.target===this)closeModal('preview-modal')">
+<div class="modal">
+  <h2 id="preview-title" style="word-break:break-all"></h2>
+  <div class="modal-body" id="preview-container"></div>
+  <div class="modal-footer">
+    <a id="preview-dl" class="btn btn-secondary" href="#">⬇ Download</a>
+    <button class="btn btn-secondary" onclick="closeModal('preview-modal')">Close</button>
+  </div>
+</div>
+</div>
+
+<script>
+function openModal(id) {
+  document.getElementById(id).className += ' open';
+  var f = document.querySelector('#'+id+' input:not([type=hidden])');
+  if (f) setTimeout(function(){ f.focus(); }, 50);
+}
+function closeModal(id) {
+  document.getElementById(id).className = document.getElementById(id).className.replace(' open','');
+  if (id === 'preview-modal') document.getElementById('preview-container').innerHTML = '';
+}
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    var modals = document.querySelectorAll('.modal-bg.open');
+    for (var i = 0; i < modals.length; i++) modals[i].className = modals[i].className.replace(' open','');
+  }
+});
+
+function openRename(rel, name) {
+  document.getElementById('rename-source').value = rel;
+  document.getElementById('rename-name').value   = name;
+  openModal('rename-modal');
+}
+function openDelete(rel, name) {
+  document.getElementById('delete-target').value = rel;
+  document.getElementById('delete-msg').textContent = 'Delete "' + name + '"?';
+  openModal('delete-modal');
+}
+
+var dropZone  = document.getElementById('drop-zone');
+var fileInput = document.getElementById('file-input');
+var preview   = document.getElementById('file-list-preview');
+
+function updatePreview(files) {
+  preview.innerHTML = '';
+  for (var i = 0; i < files.length; i++) {
+    var li = document.createElement('li');
+    var sz = files[i].size > 1048576 ? Math.round(files[i].size/1048576)+'MB' : Math.round(files[i].size/1024)+'KB';
+    li.textContent = files[i].name + ' (' + sz + ')';
+    preview.appendChild(li);
+  }
+}
+fileInput.addEventListener('change', function() { updatePreview(fileInput.files); });
+dropZone.addEventListener('dragover',  function(e) { e.preventDefault(); dropZone.className += ' drag-over'; });
+dropZone.addEventListener('dragleave', function()  { dropZone.className = dropZone.className.replace(' drag-over',''); });
+dropZone.addEventListener('drop', function(e) {
+  e.preventDefault();
+  dropZone.className = dropZone.className.replace(' drag-over','');
+  if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; updatePreview(e.dataTransfer.files); }
+});
+
+function openPreview(rel, name, type) {
+  document.getElementById('preview-title').textContent = name;
+  document.getElementById('preview-dl').href = '?action=download&file=' + encodeURIComponent(rel);
+  var url = '?action=preview&file=' + encodeURIComponent(rel);
+  var html = '';
+  if (type === 'image')      html = '<img src="'+url+'" alt="">';
+  else if (type === 'video') html = '<video controls autoplay style="max-width:100%;max-height:72vh"><source src="'+url+'"></video>';
+  else if (type === 'audio') html = '<audio controls autoplay style="width:100%"><source src="'+url+'"></audio>';
+  else if (type === 'pdf')   html = '<iframe src="'+url+'"></iframe>';
+  else if (type === 'text') {
+    fetch(url).then(function(r){ return r.text(); }).then(function(t){
+      document.getElementById('preview-container').innerHTML = '<pre>'+t.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</pre>';
+    });
+    html = '<p style="color:#6b7280;padding:1rem">Loading…</p>';
+  }
+  document.getElementById('preview-container').innerHTML = html;
+  openModal('preview-modal');
+}
+
+function filterRows(q) {
+  q = q.toLowerCase();
+  var rows = document.querySelectorAll('#tbody tr[data-name]');
+  for (var i = 0; i < rows.length; i++) {
+    var match = q === '' || rows[i].getAttribute('data-name').toLowerCase().indexOf(q) !== -1;
+    rows[i].className = match ? rows[i].className.replace(' row-hidden','') : rows[i].className + ' row-hidden';
+  }
+  var cards = document.querySelectorAll('#card-grid .card');
+  for (var j = 0; j < cards.length; j++) {
+    var cm = q === '' || cards[j].getAttribute('data-name').toLowerCase().indexOf(q) !== -1;
+    cards[j].style.display = cm ? '' : 'none';
+  }
+}
+
+// ── View toggle ──
+var currentView = localStorage.getItem('fm_view') || 'grid';
+function setView(v) {
+  currentView = v;
+  localStorage.setItem('fm_view', v);
+  var grid  = document.getElementById('card-grid');
+  var table = document.getElementById('file-table-wrap');
+  var btnL  = document.getElementById('btn-list');
+  var btnG  = document.getElementById('btn-grid');
+  if (v === 'grid') {
+    grid.style.display  = 'grid';
+    table.style.display = 'none';
+    btnG.style.background = '#4f46e5';
+    btnL.style.background = '';
+  } else {
+    grid.style.display  = 'none';
+    table.style.display = '';
+    btnL.style.background = '#4f46e5';
+    btnG.style.background = '';
+  }
+}
+setView(currentView);
+
+// ── TMDB sync ──
+function fetchOne(filename) {
+  return fetch('?action=fetch_meta&file=' + encodeURIComponent(filename))
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      if (data.ok && data.data) {
+        var cardId = 'card-' + md5hex(filename);
+        var card = document.getElementById(cardId);
+        if (card) refreshCard(card, filename, data.data);
+      }
+      return data;
+    });
+}
+
+function refreshCard(card, filename, d) {
+  if (d.poster_path) {
+    var img = card.querySelector('.card-poster, .card-poster-placeholder');
+    var newImg = document.createElement('img');
+    newImg.className = 'card-poster';
+    newImg.src = 'https://image.tmdb.org/t/p/w300' + d.poster_path;
+    newImg.alt = '';
+    newImg.setAttribute('loading','lazy');
+    if (img) img.parentNode.replaceChild(newImg, img);
+  }
+  var body = card.querySelector('.card-body');
+  if (body) {
+    var title = d.title || filename;
+    var year  = d.year  ? ' <span class="card-year" style="display:inline">' + d.year + '</span>' : '';
+    var stars = d.rating ? '<div class="card-rating">' + renderStars(d.rating) + '</div>' : '';
+    var ov    = d.overview ? '<div class="card-overview">' + escH(d.overview) + '</div>' : '';
+    body.innerHTML = '<div class="card-title">' + escH(title) + '</div>'
+                   + '<div class="card-year">' + (d.year||'') + ' — ' + body.querySelector('.card-year') && body.querySelector('.card-year').textContent.split('—')[1] || '' + '</div>'
+                   + stars + ov;
+  }
+  var nf = card.querySelector('.card-not-found');
+  if (nf) nf.parentNode.removeChild(nf);
+}
+
+function renderStars(rating) {
+  var pct = Math.round((rating/10)*100);
+  return '<span class="stars" title="'+rating+'/10">'
+       + '<span class="stars-fill" style="width:'+pct+'%">★★★★★</span>'
+       + '<span class="stars-bg">★★★★★</span>'
+       + '</span> <span class="rating-num">'+rating+'</span>';
+}
+function escH(s) { var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+// Simple MD5 is complex — use a hash based on charCode sum for card IDs instead
+function md5hex(s) {
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16).padStart(8,'0');
+}
+
+var syncQueue = [], syncTotal = 0, syncDone = 0;
+function startSync() {
+  var cards = document.querySelectorAll('#card-grid .card');
+  syncQueue = [];
+  for (var i = 0; i < cards.length; i++) {
+    var name = cards[i].getAttribute('data-name');
+    var nf   = cards[i].querySelector('.card-not-found');
+    var hasPoster = cards[i].querySelector('.card-poster');
+    if (!hasPoster) syncQueue.push(name);
+  }
+  if (!syncQueue.length) { alert('Toutes les métadonnées sont déjà chargées.'); return; }
+  syncTotal = syncQueue.length;
+  syncDone  = 0;
+  document.getElementById('sync-bar').className = 'active';
+  document.getElementById('btn-sync').disabled = true;
+  syncNext();
+}
+function syncNext() {
+  if (!syncQueue.length) {
+    document.getElementById('sync-bar').className = '';
+    document.getElementById('btn-sync').disabled = false;
+    document.getElementById('sync-progress').textContent = '';
+    return;
+  }
+  var filename = syncQueue.shift();
+  syncDone++;
+  document.getElementById('sync-progress').textContent =
+    syncDone + '/' + syncTotal + ' — ' + filename;
+  fetchOne(filename).then(function(){ setTimeout(syncNext, 300); });
+}
+
+var msgs = document.querySelectorAll('.msg');
+for (var i = 0; i < msgs.length; i++) {
+  (function(m){ setTimeout(function(){ m.style.opacity='0'; m.style.transition='opacity 1s'; }, 5000); })(msgs[i]);
+}
+function sortTable(th, colIdx) {
+  var tbody = document.getElementById('tbody');
+  var rows  = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-name]'));
+  var ths   = document.querySelectorAll('#ftable thead th');
+  for (var i = 0; i < ths.length; i++) ths[i].className = ths[i].className.replace(' sorted-asc','').replace(' sorted-desc','');
+  sortDir = (sortCol === colIdx) ? sortDir * -1 : 1;
+  sortCol = colIdx;
+  th.className += sortDir === 1 ? ' sorted-asc' : ' sorted-desc';
+  rows.sort(function(a, b) {
+    var av = (a.cells[colIdx] && a.cells[colIdx].getAttribute('data-val')) || '';
+    var bv = (b.cells[colIdx] && b.cells[colIdx].getAttribute('data-val')) || '';
+    var num = !isNaN(av) && !isNaN(bv);
+    return sortDir * (num ? av - bv : av.localeCompare(bv, undefined, {sensitivity:'base'}));
+  });
+  var folderRows = Array.prototype.slice.call(tbody.querySelectorAll('tr.folder-row'));
+  var fileRows   = rows.filter(function(r){ return !r.classList.contains('folder-row'); });
+  var sortedFolders = rows.filter(function(r){ return r.getAttribute('data-name') !== null && r.classList.contains('folder-row'); });
+  var parentRow = folderRows.filter(function(r){ return !r.getAttribute('data-name'); });
+  parentRow.concat(sortedFolders).concat(fileRows).forEach(function(r){ tbody.appendChild(r); });
+}
+
+var msgs = document.querySelectorAll('.msg');
+for (var i = 0; i < msgs.length; i++) {
+  (function(m){ setTimeout(function(){ m.style.opacity='0'; m.style.transition='opacity 1s'; }, 5000); })(msgs[i]);
+}
+</script>
+</body>
+</html>
