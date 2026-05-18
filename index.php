@@ -619,7 +619,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 .card.watched{filter:grayscale(.7);opacity:.5;transition:.2s}
 .card.watched:hover{filter:grayscale(.3);opacity:.8}
 #ftable tr.row-watched td{opacity:.4}
-#ftable tr.row-watched .btn-watch-row{background:#166534;color:#86efac}
+#ftable tr.row-watched .btn-watch-row,.btn-watch-row.active{background:#166534!important;color:#86efac!important}
 .card-fetching{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
                background:#6366f1;color:#fff;padding:.15rem .4rem;border-radius:4px}
 .card-not-found{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
@@ -759,8 +759,8 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     <a class="card-btn tmdb" href="<?php echo h($tmdb_url); ?>" target="_blank">TMDB</a>
     <?php endif; ?>
     <a class="card-btn allocine" href="<?php echo h($alloc_url); ?>" target="_blank">Allociné</a>
-    <?php if (FM_TMDB_API_KEY): ?>
     <button class="card-btn card-btn-watch" onclick="toggleWatched(this,<?php echo h(json_encode($item['name'])); ?>)" title="Marquer comme vu">👁</button>
+    <?php if (FM_TMDB_API_KEY): ?>
     <button class="card-btn card-btn-refresh" onclick="syncOne(this,<?php echo h(json_encode($item['name'])); ?>)" title="Re-chercher sur TMDB">↺</button>
     <?php endif; ?>
   </div>
@@ -1175,14 +1175,20 @@ function _setCardWatched(card, on) {
   if (on) { card.classList.add('watched'); }
   else    { card.classList.remove('watched'); }
   var btn = card.querySelector('.card-btn-watch');
-  if (btn) { btn.classList.toggle('active', on); btn.title = on ? 'Retirer des vus' : 'Marquer comme vu'; }
+  if (btn) {
+    if (on) btn.classList.add('active'); else btn.classList.remove('active');
+    btn.title = on ? 'Retirer des vus' : 'Marquer comme vu';
+  }
 }
 function _setRowWatched(row, on) {
   if (!row) return;
   if (on) { row.classList.add('row-watched'); }
   else    { row.classList.remove('row-watched'); }
   var btn = row.querySelector('.btn-watch-row');
-  if (btn) { btn.classList.toggle('active', on); btn.title = on ? 'Retirer des vus' : 'Marquer comme vu'; }
+  if (btn) {
+    if (on) btn.classList.add('active'); else btn.classList.remove('active');
+    btn.title = on ? 'Retirer des vus' : 'Marquer comme vu';
+  }
 }
 function toggleWatched(btn, filename) {
   var w = getWatched();
