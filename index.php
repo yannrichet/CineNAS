@@ -753,7 +753,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     <?php endif; ?>
     <a class="card-btn allocine" href="<?php echo h($alloc_url); ?>" target="_blank">Allociné</a>
     <?php if (FM_TMDB_API_KEY): ?>
-    <button class="card-btn" onclick="fetchOne(<?php echo json_encode($item['name']); ?>)" title="Re-chercher sur TMDB">↺</button>
+    <button class="card-btn card-btn-refresh" onclick="syncOne(this,<?php echo h(json_encode($item['name'])); ?>)" title="Re-chercher sur TMDB">↺</button>
     <?php endif; ?>
   </div>
 </div>
@@ -1025,12 +1025,26 @@ function fetchOne(filename) {
     .then(function(r){ return r.json(); })
     .then(function(data) {
       if (data.ok && data.data) {
-        // Use data-name attribute to find the card (avoids md5 mismatch)
-        var card = document.querySelector('#card-grid .card[data-name="' + filename.replace(/"/g,'&quot;') + '"]');
+        var escaped = filename.replace(/\\/g,'\\\\').replace(/"/g,'\\"');
+        var card = document.querySelector('#card-grid .card[data-name="' + escaped + '"]');
         if (card) refreshCard(card, filename, data.data);
       }
       return data;
     });
+}
+
+function syncOne(btn, filename) {
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  fetchOne(filename).then(function(data) {
+    btn.textContent = data.ok ? '✓' : '✗';
+    btn.title = data.ok ? 'Synchronisé !' : ('Non trouvé : ' + (data.error || ''));
+    setTimeout(function(){ btn.textContent = '↺'; btn.disabled = false; btn.title = 'Re-chercher sur TMDB'; }, 3000);
+  }).catch(function(e) {
+    btn.textContent = '✗';
+    btn.title = 'Erreur : ' + e;
+    setTimeout(function(){ btn.textContent = '↺'; btn.disabled = false; btn.title = 'Re-chercher sur TMDB'; }, 3000);
+  });
 }
 
 function refreshCard(card, filename, d) {
