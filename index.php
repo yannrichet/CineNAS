@@ -167,24 +167,34 @@ function meta_load($dir) {
     return is_array($data) ? $data : array();
 }
 function meta_save($data, $dir) {
-    file_put_contents(meta_file_for($dir), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    @file_put_contents(meta_file_for($dir), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 }
 function parse_movie_name($filename) {
-    // Remove extension
     $name = pathinfo($filename, PATHINFO_FILENAME);
-    // Extract year like (2017) or .2017.
     $year = null;
-    if (preg_match('/[\(\.\s](\d{4})[\)\.\s]/', $name, $m)) {
+    // Year with surrounding separator: (2017), .2017., _2017_, space2017space
+    if (preg_match('/[\(\.\s_](\d{4})[\)\.\s_]/', $name, $m)) {
+        $year = (int)$m[1];
+    // Year at end of string with a separator before it
+    } elseif (preg_match('/[\(\.\s_](\d{4})$/', $name, $m)) {
+        $year = (int)$m[1];
+    // Year directly concatenated at end (e.g. Flow2024, Sibyl2019)
+    } elseif (preg_match('/((?:19|20)\d{2})$/', $name, $m)) {
         $year = (int)$m[1];
     }
-    // Remove quality/source tags and year
-    $title = preg_replace('/[\(\[\.\s](19|20)\d{2}[\)\]\.\s].*$/i', '', $name);
+    // Remove year + everything after (quality tags, etc.)
+    $title = preg_replace('/[\(\[\.\s_](19|20)\d{2}[\)\]\.\s_].*$/i', '', $name);
+    if ($title === $name) $title = preg_replace('/[\(\[\.\s_](19|20)\d{2}[\)\]\.\s_]?$/i', '', $name);
+    if ($title === $name) $title = preg_replace('/(19|20)\d{2}$/i', '', $name);
+    // Strip quality/source tags (space-separated or bracket-enclosed)
     $title = preg_replace('/[\[\(](blu.?ray|bdrip|dvdrip|webrip|web.?dl|hdtv|hdrip|xvid|divx|x264|x265|hevc|aac|ac3|dts|multi|vf|vff|vostfr|truefrench)[^\)]*[\]\)]/i', '', $title);
     $title = preg_replace('/\.(blu.?ray|dvdrip|bdrip|webrip|web.?dl|hdtv|1080p|720p|480p|2160p|4k|xvid|x264|x265|hevc).*/i', '', $title);
+    $title = preg_replace('/[\s_]+(1080p|720p|480p|2160p|4k|vff|vf|vostfr|bluray|webrip|hdtv|bdrip|dvdrip|xvid|x264|x265|hevc|aac|ac3|dts|multi|truefrench).*/i', '', $title);
     // Replace dots and underscores with spaces
     $title = str_replace(array('.', '_'), ' ', $title);
-    // Insert spaces before uppercase letters (CamelCase)
+    // Split CamelCase
     $title = preg_replace('/([a-z])([A-Z])/', '$1 $2', $title);
+    $title = preg_replace('/\s{2,}/', ' ', $title);
     $title = trim($title);
     return array('title' => $title, 'year' => $year);
 }
@@ -237,7 +247,7 @@ function poster_download($poster_path, $dir) {
     $ctx = stream_context_create(array('http' => array('timeout' => 10)));
     $img = @file_get_contents($url, false, $ctx);
     if ($img) {
-        file_put_contents($local_path, $img);
+        @file_put_contents($local_path, $img);
         return $posters_url . $local_name;
     }
     return '';
@@ -294,10 +304,10 @@ if ($get_action === 'preview') {
 
 // ── TMDB metadata fetch (AJAX, GET) ───────────────────────────────────────────
 if ($get_action === 'fetch_meta') {
-    header('Content-Type: application/json');
-    if (!FM_TMDB_API_KEY) { echo json_encode(array('error' => 'No API key')); exit; }
+    ob_start();
+    if (!FM_TMDB_API_KEY) { ob_clean(); header('Content-Type: application/json'); echo json_encode(array('error' => 'No API key')); exit; }
     $filename = isset($_GET['file']) ? basename($_GET['file']) : '';
-    if (!$filename) { echo json_encode(array('error' => 'No file')); exit; }
+    if (!$filename) { ob_clean(); header('Content-Type: application/json'); echo json_encode(array('error' => 'No file')); exit; }
     $ajax_cwd = current_dir();
     $meta     = meta_load($ajax_cwd);
     $parsed   = parse_movie_name($filename);
@@ -309,10 +319,12 @@ if ($get_action === 'fetch_meta') {
         }
         $meta[$filename] = $result;
         meta_save($meta, $ajax_cwd);
+        ob_clean(); header('Content-Type: application/json');
         echo json_encode(array('ok' => true, 'data' => $result));
     } else {
         $meta[$filename] = array('not_found' => true, 'fetched_at' => time());
         meta_save($meta, $ajax_cwd);
+        ob_clean(); header('Content-Type: application/json');
         echo json_encode(array('ok' => false, 'error' => 'Not found on TMDB'));
     }
     exit;
@@ -1095,7 +1107,10 @@ function syncNext() {
   syncDone++;
   document.getElementById('sync-progress').textContent =
     syncDone + '/' + syncTotal + ' — ' + filename;
-  fetchOne(filename).then(function(){ setTimeout(syncNext, 300); });
+  fetchOne(filename).then(function(){ setTimeout(syncNext, 300); }).catch(function(e) {
+    console.warn('Sync error for ' + filename + ':', e);
+    setTimeout(syncNext, 300);
+  });
 }
 
 var msgs = document.querySelectorAll('.msg');
