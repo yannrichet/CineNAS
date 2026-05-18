@@ -613,6 +613,13 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 .card-btn:hover{background:#4b5563;text-decoration:none}
 .card-btn.tmdb{background:#01b4e4;color:#fff}.card-btn.tmdb:hover{background:#0099c7}
 .card-btn.allocine{background:#feb800;color:#000}.card-btn.allocine:hover{background:#d9a000}
+.card-btn-watch{background:#374151;color:#9ca3af}
+.card-btn-watch.active{background:#166534!important;color:#86efac!important}
+.card-btn-watch.active:hover{background:#15803d!important}
+.card.watched{filter:grayscale(.7);opacity:.5;transition:.2s}
+.card.watched:hover{filter:grayscale(.3);opacity:.8}
+#ftable tr.row-watched td{opacity:.4}
+#ftable tr.row-watched .btn-watch-row{background:#166534;color:#86efac}
 .card-fetching{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
                background:#6366f1;color:#fff;padding:.15rem .4rem;border-radius:4px}
 .card-not-found{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
@@ -744,7 +751,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     <?php endif; ?>
   </div>
   <div class="card-footer">
-    <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>">⬇ Film</a>
+    <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)">⬇ Film</a>
     <?php foreach ($subs as $sub): ?>
     <a class="card-btn card-btn-sub" href="?action=download&amp;file=<?php echo urlencode($sub['rel']); ?>" title="<?php echo h($sub['name']); ?>">💬 <?php echo strtoupper($sub['ext']); ?></a>
     <?php endforeach; ?>
@@ -753,6 +760,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     <?php endif; ?>
     <a class="card-btn allocine" href="<?php echo h($alloc_url); ?>" target="_blank">Allociné</a>
     <?php if (FM_TMDB_API_KEY): ?>
+    <button class="card-btn card-btn-watch" onclick="toggleWatched(this,<?php echo h(json_encode($item['name'])); ?>)" title="Marquer comme vu">👁</button>
     <button class="card-btn card-btn-refresh" onclick="syncOne(this,<?php echo h(json_encode($item['name'])); ?>)" title="Re-chercher sur TMDB">↺</button>
     <?php endif; ?>
   </div>
@@ -801,14 +809,15 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   <td class="col-size" data-val="<?php echo $item['bytes']; ?>"><?php echo fmt_size($item['bytes']); ?></td>
   <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
   <td class="col-actions">
-    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>">⬇</a>
+    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)">⬇</a>
     <?php foreach ($subs as $sub): ?>
     <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($sub['rel']); ?>" title="<?php echo h($sub['name']); ?>">💬</a>
     <?php endforeach; ?>
     <?php if ($ptype): ?>
     <button class="btn btn-secondary btn-sm"
-      onclick="openPreview(<?php echo json_encode($item['rel']); ?>,<?php echo json_encode($item['name']); ?>,<?php echo json_encode($ptype); ?>)">👁</button>
+      onclick="openPreview(<?php echo h(json_encode($item['rel'])); ?>,<?php echo h(json_encode($item['name'])); ?>,<?php echo h(json_encode($ptype)); ?>)">▶</button>
     <?php endif; ?>
+    <button class="btn btn-secondary btn-sm btn-watch-row" onclick="toggleWatched(this,<?php echo h(json_encode($item['name'])); ?>)" title="Marquer comme vu">👁</button>
   </td>
 </tr>
 <?php endforeach; ?>
@@ -1127,10 +1136,6 @@ function syncNext() {
   });
 }
 
-var msgs = document.querySelectorAll('.msg');
-for (var i = 0; i < msgs.length; i++) {
-  (function(m){ setTimeout(function(){ m.style.opacity='0'; m.style.transition='opacity 1s'; }, 5000); })(msgs[i]);
-}
 function sortTable(th, colIdx) {
   var tbody = document.getElementById('tbody');
   var rows  = Array.prototype.slice.call(tbody.querySelectorAll('tr[data-name]'));
@@ -1156,6 +1161,54 @@ var msgs = document.querySelectorAll('.msg');
 for (var i = 0; i < msgs.length; i++) {
   (function(m){ setTimeout(function(){ m.style.opacity='0'; m.style.transition='opacity 1s'; }, 5000); })(msgs[i]);
 }
-</script>
+
+// ── Watched list (localStorage) ────────────────────────────────────────────────
+function getWatched() {
+  try { return JSON.parse(localStorage.getItem('cinenas_watched') || '{}'); } catch(e) { return {}; }
+}
+function setWatched(w) {
+  try { localStorage.setItem('cinenas_watched', JSON.stringify(w)); } catch(e) {}
+}
+function _esc(s) { return s.replace(/\\/g,'\\\\').replace(/"/g,'\\"'); }
+function _setCardWatched(card, on) {
+  if (!card) return;
+  if (on) { card.classList.add('watched'); }
+  else    { card.classList.remove('watched'); }
+  var btn = card.querySelector('.card-btn-watch');
+  if (btn) { btn.classList.toggle('active', on); btn.title = on ? 'Retirer des vus' : 'Marquer comme vu'; }
+}
+function _setRowWatched(row, on) {
+  if (!row) return;
+  if (on) { row.classList.add('row-watched'); }
+  else    { row.classList.remove('row-watched'); }
+  var btn = row.querySelector('.btn-watch-row');
+  if (btn) { btn.classList.toggle('active', on); btn.title = on ? 'Retirer des vus' : 'Marquer comme vu'; }
+}
+function toggleWatched(btn, filename) {
+  var w = getWatched();
+  var on = !w[filename];
+  if (on) w[filename] = 1; else delete w[filename];
+  setWatched(w);
+  _setCardWatched(document.querySelector('#card-grid .card[data-name="' + _esc(filename) + '"]'), on);
+  _setRowWatched(document.querySelector('#tbody tr[data-name="' + _esc(filename) + '"]'), on);
+}
+function markWatched(filename) {
+  var w = getWatched();
+  if (w[filename]) return;
+  w[filename] = 1; setWatched(w);
+  _setCardWatched(document.querySelector('#card-grid .card[data-name="' + _esc(filename) + '"]'), true);
+  _setRowWatched(document.querySelector('#tbody tr[data-name="' + _esc(filename) + '"]'), true);
+}
+// Init: apply saved state on page load
+(function() {
+  var w = getWatched();
+  Array.prototype.forEach.call(document.querySelectorAll('#card-grid .card'), function(c) {
+    if (w[c.getAttribute('data-name')]) _setCardWatched(c, true);
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('#tbody tr[data-name]'), function(r) {
+    if (w[r.getAttribute('data-name')]) _setRowWatched(r, true);
+  });
+})();
+
 </body>
 </html>
