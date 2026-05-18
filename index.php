@@ -1195,8 +1195,13 @@ function toggleWatched(btn, filename) {
   var on = !w[filename];
   if (on) w[filename] = 1; else delete w[filename];
   setWatched(w);
-  _setCardWatched(document.querySelector('#card-grid .card[data-name="' + _esc(filename) + '"]'), on);
-  _setRowWatched(document.querySelector('#tbody tr[data-name="' + _esc(filename) + '"]'), on);
+  // Use closest() for reliability on mobile — avoids CSS attribute selector encoding issues
+  var card = (btn && btn.closest) ? btn.closest('.card') : null;
+  if (!card) card = document.querySelector('#card-grid .card[data-name="' + _esc(filename) + '"]');
+  _setCardWatched(card, on);
+  var row = (btn && btn.closest) ? btn.closest('tr') : null;
+  if (!row) row = document.querySelector('#tbody tr[data-name="' + _esc(filename) + '"]');
+  _setRowWatched(row, on);
 }
 function markWatched(filename) {
   var w = getWatched();
