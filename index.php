@@ -302,6 +302,29 @@ if ($get_action === 'preview') {
     http_response_code(404); exit;
 }
 
+// ── Cache poster sent by browser (AJAX, POST) ─────────────────────────────────
+if ($get_action === 'cache_poster' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    $filename = isset($_POST['file']) ? $_POST['file'] : '';
+    if (!$filename || empty($_FILES['img']['tmp_name'])) { echo '{"ok":false}'; exit; }
+    $ajax_cwd = current_dir();
+    $meta = meta_load($ajax_cwd);
+    if (!isset($meta[$filename]) || !empty($meta[$filename]['poster_local'])) { echo '{"ok":false}'; exit; }
+    $poster_path = !empty($meta[$filename]['poster_path']) ? $meta[$filename]['poster_path'] : '';
+    if (!$poster_path) { echo '{"ok":false}'; exit; }
+    $posters_dir = posters_dir_for($ajax_cwd);
+    if (!is_dir($posters_dir)) @mkdir($posters_dir, 0755, true);
+    $local_name  = md5($poster_path) . '.jpg';
+    $local_path  = $posters_dir . DIRECTORY_SEPARATOR . $local_name;
+    if (!file_exists($local_path)) move_uploaded_file($_FILES['img']['tmp_name'], $local_path);
+    if (file_exists($local_path)) {
+        $meta[$filename]['poster_local'] = posters_url_for($ajax_cwd) . $local_name;
+        meta_save($meta, $ajax_cwd);
+        echo '{"ok":true}';
+    } else { echo '{"ok":false}'; }
+    exit;
+}
+
 // ── TMDB metadata fetch (AJAX, GET) ───────────────────────────────────────────
 if ($get_action === 'fetch_meta') {
     ob_start();
@@ -734,7 +757,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 <div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>">
   <span class="card-watched-badge">✓ Vu</span>
   <?php if ($poster): ?>
-    <img class="card-poster" src="<?php echo h($poster); ?>" alt="">
+    <img class="card-poster" src="<?php echo h($poster); ?>" alt=""<?php if (empty($m['poster_local']) && !empty($m['poster_path'])): ?> crossorigin="anonymous" data-cache-name="<?php echo h($item['name']); ?>"<?php endif; ?>>
   <?php else: ?>
     <div class="card-poster-placeholder">🎬</div>
   <?php endif; ?>
@@ -1226,6 +1249,35 @@ function markWatched(filename) {
   Array.prototype.forEach.call(document.querySelectorAll('#tbody tr[data-name]'), function(r) {
     if (w[r.getAttribute('data-name')]) _setRowWatched(r, true);
   });
+})();
+
+// ── Background poster caching (browser downloads → server saves) ──────────────
+(function() {
+  var imgs = document.querySelectorAll('img.card-poster[data-cache-name]');
+  if (!imgs.length) return;
+  var dirParam = currentDir ? '&dir=' + encodeURIComponent(currentDir) : '';
+  var queue = Array.prototype.slice.call(imgs);
+  var running = 0, max = 4;
+  function next() {
+    while (running < max && queue.length) {
+      running++;
+      (function(img) {
+        var name = img.getAttribute('data-cache-name');
+        fetch(img.src, {mode:'cors', cache:'force-cache'})
+          .then(function(r){ return r.blob(); })
+          .then(function(blob){
+            var fd = new FormData();
+            fd.append('file', name);
+            fd.append('img', blob, 'poster.jpg');
+            return fetch('?action=cache_poster' + dirParam, {method:'POST', body:fd});
+          })
+          .catch(function(){ return null; })
+          .then(function(){ running--; next(); });
+      })(queue.shift());
+    }
+  }
+  // Start after a short delay to not compete with initial page render
+  setTimeout(next, 2000);
 })();
 
 </script>
