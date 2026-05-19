@@ -14,7 +14,7 @@ if (!file_exists($config_file)) {
 require $config_file;
 
 define('FM_ROOT',          realpath(__DIR__));
-define('FM_TITLE',         'File Manager');
+define('FM_TITLE',         'CineNAS');
 define('FM_MAX_UPLOAD_MB', 512);
 define('FM_DEMO_MODE',     false);
 define('FM_ALLOWED_EXT',   implode(',', array(
