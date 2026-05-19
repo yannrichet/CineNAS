@@ -616,8 +616,11 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 .card-btn-watch{background:#374151;color:#9ca3af}
 .card-btn-watch.active{background:#166534!important;color:#86efac!important}
 .card-btn-watch.active:hover{background:#15803d!important}
-.card.watched{filter:grayscale(.7);opacity:.5;transition:.2s}
-.card.watched:hover{filter:grayscale(.3);opacity:.8}
+.card.watched{opacity:.55;transition:.2s}
+.card.watched:hover{opacity:.85}
+.card-watched-badge{display:none;position:absolute;top:6px;left:6px;background:rgba(22,101,52,.9);
+  color:#86efac;font-size:.7rem;padding:2px 6px;border-radius:4px;pointer-events:none;z-index:2}
+.card.watched .card-watched-badge{display:block}
 #ftable tr.row-watched td{opacity:.4}
 #ftable tr.row-watched .btn-watch-row,.btn-watch-row.active{background:#166534!important;color:#86efac!important}
 .card-fetching{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
@@ -656,6 +659,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   .card-rating{font-size:.62rem}
   .card-footer{padding:.2rem .3rem;gap:.15rem;flex-wrap:wrap}
   .card-btn{padding:.15rem .28rem;font-size:.6rem}
+  .card-btn-watch{font-size:.9rem;padding:.3rem .5rem;min-height:32px;min-width:32px}
   .col-date,.col-size{display:none}
   td{padding:.4rem .5rem}
 }
@@ -728,6 +732,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   $subs = isset($subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))]) ? $subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))] : array();
 ?>
 <div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>">
+  <span class="card-watched-badge">✓ Vu</span>
   <?php if ($poster): ?>
     <img class="card-poster" src="<?php echo h($poster); ?>" alt="" loading="lazy">
   <?php else: ?>
