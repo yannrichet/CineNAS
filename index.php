@@ -1228,5 +1228,6 @@ function markWatched(filename) {
   });
 })();
 
+</script>
 </body>
 </html>
