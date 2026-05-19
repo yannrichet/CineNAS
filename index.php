@@ -734,7 +734,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 <div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>">
   <span class="card-watched-badge">✓ Vu</span>
   <?php if ($poster): ?>
-    <img class="card-poster" src="<?php echo h($poster); ?>" alt="" loading="lazy">
+    <img class="card-poster" src="<?php echo h($poster); ?>" alt="">
   <?php else: ?>
     <div class="card-poster-placeholder">🎬</div>
   <?php endif; ?>
