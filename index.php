@@ -1009,24 +1009,26 @@ function filterRows(q) {
 }
 
 // ── View toggle ──
-var currentView = localStorage.getItem('fm_view') || 'grid';
+var currentView = 'grid';
+try { currentView = localStorage.getItem('fm_view') || 'grid'; } catch(e) {}
 function setView(v) {
   currentView = v;
-  localStorage.setItem('fm_view', v);
+  try { localStorage.setItem('fm_view', v); } catch(e) {}
   var grid  = document.getElementById('card-grid');
   var table = document.getElementById('file-table-wrap');
   var btnL  = document.getElementById('btn-list');
   var btnG  = document.getElementById('btn-grid');
+  if (!grid || !table) return;
   if (v === 'grid') {
     grid.style.display  = 'grid';
     table.style.display = 'none';
-    btnG.style.background = '#4f46e5';
-    btnL.style.background = '';
+    if (btnG) btnG.style.background = '#4f46e5';
+    if (btnL) btnL.style.background = '';
   } else {
     grid.style.display  = 'none';
     table.style.display = '';
-    btnL.style.background = '#4f46e5';
-    btnG.style.background = '';
+    if (btnL) btnL.style.background = '#4f46e5';
+    if (btnG) btnG.style.background = '';
   }
 }
 setView(currentView);
