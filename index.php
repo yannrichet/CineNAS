@@ -439,6 +439,39 @@ if ($get_action === 'fetch_meta') {
     exit;
 }
 
+// ── Rename file (AJAX, GET) ───────────────────────────────────────────────────
+if ($get_action === 'rename_file') {
+    header('Content-Type: application/json');
+    $ajax_cwd = current_dir();
+    $oldname  = isset($_GET['file'])    ? basename($_GET['file'])    : '';
+    $newname  = isset($_GET['newname']) ? basename($_GET['newname']) : '';
+    if (!$oldname || !$newname) { echo json_encode(array('ok'=>false,'error'=>'Paramètres manquants')); exit; }
+    // Keep same extension
+    $old_ext = strtolower(pathinfo($oldname, PATHINFO_EXTENSION));
+    $new_ext = strtolower(pathinfo($newname, PATHINFO_EXTENSION));
+    if (!$new_ext || $new_ext !== $old_ext) {
+        $newname = pathinfo($newname, PATHINFO_FILENAME) . '.' . $old_ext;
+    }
+    if ($oldname === $newname) { echo json_encode(array('ok'=>true,'newfile'=>$newname)); exit; }
+    $old_path = $ajax_cwd . DIRECTORY_SEPARATOR . $oldname;
+    $new_path = $ajax_cwd . DIRECTORY_SEPARATOR . $newname;
+    if (strncmp($old_path, FM_ROOT, strlen(FM_ROOT)) !== 0 ||
+        strncmp($new_path, FM_ROOT, strlen(FM_ROOT)) !== 0) {
+        echo json_encode(array('ok'=>false,'error'=>'Accès refusé')); exit;
+    }
+    if (!file_exists($old_path)) { echo json_encode(array('ok'=>false,'error'=>'Fichier introuvable')); exit; }
+    if (file_exists($new_path))  { echo json_encode(array('ok'=>false,'error'=>'Un fichier avec ce nom existe déjà')); exit; }
+    if (!@rename($old_path, $new_path)) { echo json_encode(array('ok'=>false,'error'=>'Renommage impossible')); exit; }
+    // Move meta entry to new key
+    $meta = meta_load($ajax_cwd);
+    if (isset($meta[$oldname])) {
+        $meta[$newname] = $meta[$oldname];
+        unset($meta[$oldname]);
+        meta_save($meta, $ajax_cwd);
+    }
+    echo json_encode(array('ok'=>true,'newfile'=>$newname)); exit;
+}
+
 // ── Delete meta entry (AJAX, GET) ─────────────────────────────────────────────
 if ($get_action === 'delete_meta') {
     header('Content-Type: application/json');
@@ -1362,52 +1395,65 @@ function refreshCard(card, filename, d) {
 
 function editMovieTitle(editBtn, filename) {
   var card = editBtn.closest ? editBtn.closest('.card') : null;
-  var titleEl = card ? card.querySelector('.card-title') : null;
-  var currentTitle = titleEl ? titleEl.textContent.trim() : filename;
-  // Build overlay
+  // Pre-fill with filename stem (without extension)
+  var stem = filename.replace(/\.[^.]+$/, '');
   var overlay = document.createElement('div');
   overlay.className = 'edit-title-overlay';
   overlay.innerHTML = '<div class="edit-title-box">'
-    + '<p style="margin:0 0 .75rem;font-weight:600;font-size:1rem">Titre de recherche TMDB</p>'
-    + '<p style="margin:0 0 .5rem;font-size:.8rem;color:#9ca3af">Fichier&nbsp;: ' + escH(filename) + '</p>'
-    + '<input type="text" id="edit-title-input" value="' + escH(currentTitle) + '" autocomplete="off" spellcheck="false">'
-    + '<p style="margin:.4rem 0 .75rem;font-size:.75rem;color:#6b7280">Vous pouvez ajouter l\'année : <em>The Mask 1994</em></p>'
+    + '<p style="margin:0 0 .75rem;font-weight:600;font-size:1rem">✎ Renommer le fichier</p>'
+    + '<p style="margin:0 0 .4rem;font-size:.8rem;color:#9ca3af">Ancien nom&nbsp;: <em>' + escH(filename) + '</em></p>'
+    + '<input type="text" id="edit-title-input" value="' + escH(stem) + '" autocomplete="off" spellcheck="false">'
+    + '<p style="margin:.35rem 0 .75rem;font-size:.75rem;color:#6b7280">L\'extension est conservée automatiquement.<br>Conseil : inclure l\'année pour TMDB, ex&nbsp;: <em>Star Wars Episode 5 1980</em></p>'
+    + '<div id="edit-title-error" style="display:none;color:#f87171;font-size:.8rem;margin-bottom:.5rem"></div>'
     + '<div style="display:flex;gap:.5rem;justify-content:flex-end">'
     + '<button id="edit-title-cancel" class="btn btn-secondary" style="font-size:.85rem;padding:.3rem .75rem">Annuler</button>'
-    + '<button id="edit-title-confirm" class="btn btn-primary" style="font-size:.85rem;padding:.3rem .75rem">🔍 Rechercher</button>'
+    + '<button id="edit-title-confirm" class="btn btn-primary" style="font-size:.85rem;padding:.3rem .75rem">Renommer &amp; Sync ↺</button>'
     + '</div></div>';
   document.body.appendChild(overlay);
-  var input = document.getElementById('edit-title-input');
+  var input   = document.getElementById('edit-title-input');
+  var errDiv  = document.getElementById('edit-title-error');
+  var dirParam = currentDir ? '&dir=' + encodeURIComponent(currentDir) : '';
   input.focus(); input.select();
-  function doConfirm() {
-    var newTitle = input.value.trim();
-    if (!newTitle) return;
-    document.body.removeChild(overlay);
-    var refreshBtn = card ? card.querySelector('.card-btn-refresh') : null;
-    if (refreshBtn) syncOneWithTitle(refreshBtn, filename, newTitle);
-    else fetchOne(filename, newTitle);
+  function doRename() {
+    var newStem = input.value.trim();
+    if (!newStem) return;
+    var confirmBtn = document.getElementById('edit-title-confirm');
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = '⏳';
+    errDiv.style.display = 'none';
+    fetch('?action=rename_file&file=' + encodeURIComponent(filename)
+        + '&newname=' + encodeURIComponent(newStem) + dirParam)
+      .then(function(r){ return r.json(); })
+      .then(function(data) {
+        if (!data.ok) {
+          errDiv.textContent = data.error || 'Erreur inconnue';
+          errDiv.style.display = '';
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = 'Renommer & Sync ↺';
+          return;
+        }
+        document.body.removeChild(overlay);
+        // Trigger TMDB sync on the new filename then reload
+        var newfile = data.newfile;
+        fetch('?action=fetch_meta&file=' + encodeURIComponent(newfile) + dirParam)
+          .catch(function(){})
+          .then(function(){ location.reload(); });
+      })
+      .catch(function(e) {
+        errDiv.textContent = 'Erreur réseau : ' + e;
+        errDiv.style.display = '';
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Renommer & Sync ↺';
+      });
   }
   document.getElementById('edit-title-cancel').onclick = function() { document.body.removeChild(overlay); };
-  document.getElementById('edit-title-confirm').onclick = doConfirm;
+  document.getElementById('edit-title-confirm').onclick = doRename;
   input.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter')  doConfirm();
+    if (e.key === 'Enter')  doRename();
     if (e.key === 'Escape') document.body.removeChild(overlay);
   });
   overlay.addEventListener('click', function(e) {
     if (e.target === overlay) document.body.removeChild(overlay);
-  });
-}
-function syncOneWithTitle(btn, filename, customTitle) {
-  btn.disabled = true;
-  btn.textContent = '⏳';
-  fetchOne(filename, customTitle).then(function(data) {
-    btn.textContent = data.ok ? '✓' : '✗';
-    btn.title = data.ok ? 'Synchronisé !' : ('Non trouvé : ' + (data.error || ''));
-    setTimeout(function(){ btn.textContent = '↺'; btn.disabled = false; btn.title = 'Re-chercher sur TMDB'; }, 3000);
-  }).catch(function(e) {
-    btn.textContent = '✗';
-    btn.title = 'Erreur : ' + e;
-    setTimeout(function(){ btn.textContent = '↺'; btn.disabled = false; btn.title = 'Re-chercher sur TMDB'; }, 3000);
   });
 }
 
