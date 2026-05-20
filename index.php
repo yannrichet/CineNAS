@@ -154,7 +154,9 @@ function safe_filename($name) {
 function meta_file_for($dir)    { return $dir . DIRECTORY_SEPARATOR . '.movies_meta.json'; }
 function posters_dir_for($dir)  { return $dir . DIRECTORY_SEPARATOR . '.posters'; }
 function posters_url_for($dir)  {
-    $rel = ltrim(substr(realpath($dir), strlen(FM_ROOT)), DIRECTORY_SEPARATOR);
+    // $dir comes from jail() which already roots the path at FM_ROOT —
+    // avoid realpath() which can return a different path on NAS/symlink setups.
+    $rel = ltrim(substr($dir, strlen(FM_ROOT)), DIRECTORY_SEPARATOR);
     $base = ($rel === '') ? '' : str_replace(DIRECTORY_SEPARATOR, '/', $rel) . '/';
     return $base . '.posters/';
 }
@@ -342,7 +344,13 @@ if ($get_action === 'fetch_meta') {
     if (!$filename) { ob_clean(); header('Content-Type: application/json'); echo json_encode(array('error' => 'No file')); exit; }
     $ajax_cwd = current_dir();
     $meta     = meta_load($ajax_cwd);
-    $parsed   = parse_movie_name($filename);
+    // Strip multi-part suffix before TMDB search so "Movie.CD1.mkv" searches
+    // for "Movie" rather than "Movie CD1" (which TMDB can't match).
+    $_pd_fetch = detect_movie_parts($filename);
+    $search_name = ($_pd_fetch !== null)
+        ? $_pd_fetch['base'] . '.' . pathinfo($filename, PATHINFO_EXTENSION)
+        : $filename;
+    $parsed   = parse_movie_name($search_name);
     $result   = tmdb_fetch($parsed['title'], $parsed['year']);
     if ($result) {
         if (!empty($result['poster_path'])) {
