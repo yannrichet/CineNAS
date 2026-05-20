@@ -171,6 +171,33 @@ function meta_load($dir) {
 function meta_save($data, $dir) {
     @file_put_contents(meta_file_for($dir), json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 }
+// Returns 0-100: percentage of significant query words found in result_title.
+// Used to flag low-confidence TMDB matches.
+function title_confidence($query, $result_title) {
+    $normalize = function($s) {
+        $s = mb_strtolower($s, 'UTF-8');
+        $s = preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $s);
+        $words = preg_split('/\s+/', trim($s), -1, PREG_SPLIT_NO_EMPTY);
+        $stop = array('the','a','an','de','la','le','les','du','des','et','of','in','l','d','un','une');
+        return array_values(array_filter($words, function($w) use ($stop) {
+            return mb_strlen($w) > 2 && !in_array($w, $stop);
+        }));
+    };
+    $qw = $normalize($query);
+    $rw = $normalize($result_title);
+    if (empty($qw) || empty($rw)) return 50;
+    $common = count(array_intersect($qw, $rw));
+    return (int)round(100 * $common / max(count($qw), count($rw)));
+}
+function roman_to_arabic($s) {
+    $map = array('CM'=>900,'M'=>1000,'CD'=>400,'D'=>500,'XC'=>90,'C'=>100,'XL'=>40,'L'=>50,'IX'=>9,'X'=>10,'IV'=>4,'V'=>5,'I'=>1);
+    $s = strtoupper(trim($s));
+    $n = 0;
+    foreach ($map as $k => $v) {
+        while (substr($s, 0, strlen($k)) === $k) { $n += $v; $s = substr($s, strlen($k)); }
+    }
+    return ($n > 0 && $s === '') ? $n : null;
+}
 function parse_movie_name($filename) {
     $name = pathinfo($filename, PATHINFO_FILENAME);
     $year = null;
@@ -201,6 +228,11 @@ function parse_movie_name($filename) {
     $title = preg_replace('/([a-z])([A-Z])/', '$1 $2', $title);
     $title = preg_replace('/\s{2,}/', ' ', $title);
     $title = trim($title);
+    // Convert Roman numeral episode numbers: "Episode V" → "Episode 5" (better TMDB matching)
+    $title = preg_replace_callback('/\bEpisode\s+([IVXLCDM]+)\b/i', function($m) {
+        $n = roman_to_arabic($m[1]);
+        return $n ? 'Episode ' . $n : $m[0];
+    }, $title);
     return array('title' => $title, 'year' => $year);
 }
 // Detects multi-part naming patterns (part1/cd1/disc1/d1 …) in a filename.
@@ -238,6 +270,22 @@ function tmdb_fetch($title, $year = null) {
         return null;
     }
     $m = $data['results'][0];
+    // If the query contains "Episode N" (Arabic), prefer a result whose title
+    // also contains "Episode N" or "Episode <roman>" — avoids TMDB returning
+    // the most popular film in a franchise instead of the specific episode.
+    if (preg_match('/\bEpisode\s+(\d+)\b/i', $title, $ep)) {
+        $ep_num = (int)$ep[1];
+        $roman_map = array(1=>'I',2=>'II',3=>'III',4=>'IV',5=>'V',6=>'VI',7=>'VII',8=>'VIII',9=>'IX',10=>'X');
+        $ep_roman  = isset($roman_map[$ep_num]) ? $roman_map[$ep_num] : null;
+        foreach ($data['results'] as $candidate) {
+            $ct = (isset($candidate['title']) ? $candidate['title'] : '') . ' '
+                . (isset($candidate['original_title']) ? $candidate['original_title'] : '');
+            $matched = preg_match('/\bEpisode\s+' . $ep_num . '\b/i', $ct)
+                    || ($ep_roman && preg_match('/\bEpisode\s+' . preg_quote($ep_roman, '/') . '\b/i', $ct));
+            if ($matched) { $m = $candidate; break; }
+        }
+    }
+    $result_title = isset($m['title']) ? $m['title'] : (isset($m['original_title']) ? $m['original_title'] : '');
     return array(
         'tmdb_id'     => $m['id'],
         'title'       => isset($m['title'])          ? $m['title']          : $title,
@@ -248,6 +296,7 @@ function tmdb_fetch($title, $year = null) {
         'votes'       => isset($m['vote_count'])     ? $m['vote_count']     : 0,
         'overview'    => isset($m['overview'])       ? $m['overview']       : '',
         'fetched_at'  => time(),
+        'confidence'  => title_confidence($title, $result_title),
     );
 }
 function poster_download($poster_path, $dir) {
@@ -352,19 +401,31 @@ if ($get_action === 'fetch_meta') {
     if (!$filename) { ob_clean(); header('Content-Type: application/json'); echo json_encode(array('error' => 'No file')); exit; }
     $ajax_cwd = current_dir();
     $meta     = meta_load($ajax_cwd);
-    // Strip multi-part suffix before TMDB search so "Movie.CD1.mkv" searches
-    // for "Movie" rather than "Movie CD1" (which TMDB can't match).
-    $_pd_fetch = detect_movie_parts($filename);
-    $search_name = ($_pd_fetch !== null)
-        ? $_pd_fetch['base'] . '.' . pathinfo($filename, PATHINFO_EXTENSION)
-        : $filename;
-    $parsed   = parse_movie_name($search_name);
+    // Optional custom search title supplied by the user via the edit-title UI
+    $custom_title = isset($_GET['custom_title']) ? trim($_GET['custom_title']) : '';
+    if ($custom_title) {
+        // Allow "Title (Year)" or "Title Year" notation in the custom title
+        $parsed = array('title' => $custom_title, 'year' => null);
+        if (preg_match('/\b((?:19|20)\d{2})\b/', $custom_title, $ym)) {
+            $parsed['year']  = (int)$ym[1];
+            $parsed['title'] = trim(preg_replace('/\b(?:19|20)\d{2}\b/', '', $custom_title));
+        }
+    } else {
+        // Strip multi-part suffix before TMDB search so "Movie.CD1.mkv" searches
+        // for "Movie" rather than "Movie CD1" (which TMDB can't match).
+        $_pd_fetch = detect_movie_parts($filename);
+        $search_name = ($_pd_fetch !== null)
+            ? $_pd_fetch['base'] . '.' . pathinfo($filename, PATHINFO_EXTENSION)
+            : $filename;
+        $parsed = parse_movie_name($search_name);
+    }
     $result   = tmdb_fetch($parsed['title'], $parsed['year']);
     if ($result) {
         if (!empty($result['poster_path'])) {
             $local = poster_download($result['poster_path'], $ajax_cwd);
             if ($local) $result['poster_local'] = $local;
         }
+        if ($custom_title) $result['custom_title'] = $custom_title;
         $meta[$filename] = $result;
         meta_save($meta, $ajax_cwd);
         ob_clean(); header('Content-Type: application/json');
@@ -697,6 +758,29 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
                background:#6366f1;color:#fff;padding:.15rem .4rem;border-radius:4px}
 .card-not-found{position:absolute;top:.4rem;right:.4rem;font-size:.7rem;
                 background:#374151;color:#9ca3af;padding:.15rem .4rem;border-radius:4px}
+.card-bad-match {
+  position:absolute;top:.5rem;left:.5rem;z-index:3;
+  background:#f59e0b;color:#000;font-size:.75rem;font-weight:700;
+  padding:.15rem .35rem;border-radius:.25rem;cursor:default;
+  line-height:1;
+}
+.card--bad-match { outline:2px solid #f59e0b; }
+.card-btn-edit { background:#6366f1; }
+.card-btn-edit:hover { background:#4f46e5; }
+.edit-title-overlay {
+  position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.75);
+  display:flex;align-items:center;justify-content:center;padding:1rem;
+}
+.edit-title-box {
+  background:#111827;border:1px solid #374151;border-radius:.75rem;
+  padding:1.5rem;width:100%;max-width:440px;color:#f9fafb;box-shadow:0 8px 32px rgba(0,0,0,.6);
+}
+.edit-title-box input[type=text] {
+  width:100%;box-sizing:border-box;padding:.45rem .65rem;
+  border:1px solid #374151;border-radius:.35rem;
+  background:#1f2937;color:#f9fafb;font-size:.95rem;
+}
+.edit-title-box input[type=text]:focus { outline:none;border-color:#6366f1; }
 /* Stars */
 .stars{position:relative;display:inline-block;font-size:.9rem;line-height:1}
 .stars-bg{color:#374151}
@@ -845,7 +929,12 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     'parts'        => count($film_parts) > 0 ? count($film_parts) : 1,
   ));
 ?>
-<div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>" data-meta="<?php echo h($card_meta); ?>">
+<?php
+  $not_found = ($m && !empty($m['not_found']));
+  $confidence = ($m && isset($m['confidence'])) ? (int)$m['confidence'] : ($m ? 100 : -1);
+  $bad_match  = (!$not_found && $m && $confidence >= 0 && $confidence < 45);
+?>
+<div class="card<?php echo $bad_match ? ' card--bad-match' : ''; ?>" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>" data-meta="<?php echo h($card_meta); ?>">
   <span class="card-watched-badge">✓ Vu</span>
   <?php if ($poster): ?>
     <img class="card-poster" src="<?php echo h($poster); ?>" alt=""<?php if (empty($m['poster_local']) && !empty($m['poster_path'])): ?> crossorigin="anonymous" data-cache-name="<?php echo h($item['name']); ?>"<?php endif; ?>>
@@ -854,6 +943,8 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   <?php endif; ?>
   <?php if ($not_found): ?>
     <span class="card-not-found" title="Non trouvé sur TMDB">?</span>
+  <?php elseif ($bad_match): ?>
+    <span class="card-bad-match" title="Identification TMDB incertaine (<?php echo $confidence; ?>% de correspondance) — cliquez ✎ pour corriger">⚠</span>
   <?php endif; ?>
   <div class="card-body">
     <div class="card-title"><?php echo $m && !empty($m['title']) ? h($m['title']) : h(pathinfo($item['name'], PATHINFO_FILENAME)); ?></div>
@@ -887,6 +978,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     <button class="card-btn card-btn-watch" onclick="toggleWatched(this,<?php echo h(json_encode($item['name'])); ?>)" title="Marquer comme vu">👁</button>
     <?php if (FM_TMDB_API_KEY): ?>
     <button class="card-btn card-btn-refresh" onclick="syncOne(this,<?php echo h(json_encode($item['name'])); ?>)" title="Re-chercher sur TMDB">↺</button>
+    <button class="card-btn card-btn-edit" onclick="editMovieTitle(this,<?php echo h(json_encode($item['name'])); ?>)" title="Modifier le titre de recherche TMDB">✎</button>
     <?php endif; ?>
   </div>
 </div>
@@ -1194,9 +1286,10 @@ setView(currentView);
 
 // ── TMDB sync ──
 var currentDir = <?php echo json_encode($cwd_rel); ?>;
-function fetchOne(filename) {
+function fetchOne(filename, customTitle) {
   var dirParam = currentDir ? '&dir=' + encodeURIComponent(currentDir) : '';
-  return fetch('?action=fetch_meta&file=' + encodeURIComponent(filename) + dirParam)
+  var ctParam  = customTitle ? '&custom_title=' + encodeURIComponent(customTitle) : '';
+  return fetch('?action=fetch_meta&file=' + encodeURIComponent(filename) + dirParam + ctParam)
     .then(function(r){ return r.json(); })
     .then(function(data) {
       if (data.ok && data.data) {
@@ -1247,9 +1340,75 @@ function refreshCard(card, filename, d) {
                    + '<div class="card-year">' + (d.year || '') + (sizeText ? ' — ' + sizeText : '') + '</div>'
                    + stars + ov;
   }
-  // Remove "not found" badge if present
+  var meta = {};
+  try { meta = JSON.parse(card.getAttribute('data-meta') || '{}'); } catch(e) {}
+  meta.title = d.title || filename;
+  meta.year = d.year || null;
+  meta.rating = typeof d.rating !== 'undefined' ? d.rating : null;
+  meta.overview = d.overview || '';
+  meta.poster_path = d.poster_path || '';
+  meta.poster_local = d.poster_local || '';
+  meta.filename = meta.filename || filename;
+  meta.alloc_url = 'https://www.allocine.fr/rechercher/movie/?q=' + encodeURIComponent(meta.title);
+  if (d.tmdb_id) meta.tmdb_url = 'https://www.themoviedb.org/movie/' + d.tmdb_id;
+  card.setAttribute('data-meta', JSON.stringify(meta));
+  // Remove "not found" and "bad match" badges if present
   var nf = card.querySelector('.card-not-found');
   if (nf) nf.parentNode.removeChild(nf);
+  var bm = card.querySelector('.card-bad-match');
+  if (bm) bm.parentNode.removeChild(bm);
+  card.classList.remove('card--bad-match');
+}
+
+function editMovieTitle(editBtn, filename) {
+  var card = editBtn.closest ? editBtn.closest('.card') : null;
+  var titleEl = card ? card.querySelector('.card-title') : null;
+  var currentTitle = titleEl ? titleEl.textContent.trim() : filename;
+  // Build overlay
+  var overlay = document.createElement('div');
+  overlay.className = 'edit-title-overlay';
+  overlay.innerHTML = '<div class="edit-title-box">'
+    + '<p style="margin:0 0 .75rem;font-weight:600;font-size:1rem">Titre de recherche TMDB</p>'
+    + '<p style="margin:0 0 .5rem;font-size:.8rem;color:#9ca3af">Fichier&nbsp;: ' + escH(filename) + '</p>'
+    + '<input type="text" id="edit-title-input" value="' + escH(currentTitle) + '" autocomplete="off" spellcheck="false">'
+    + '<p style="margin:.4rem 0 .75rem;font-size:.75rem;color:#6b7280">Vous pouvez ajouter l\'année : <em>The Mask 1994</em></p>'
+    + '<div style="display:flex;gap:.5rem;justify-content:flex-end">'
+    + '<button id="edit-title-cancel" class="btn btn-secondary" style="font-size:.85rem;padding:.3rem .75rem">Annuler</button>'
+    + '<button id="edit-title-confirm" class="btn btn-primary" style="font-size:.85rem;padding:.3rem .75rem">🔍 Rechercher</button>'
+    + '</div></div>';
+  document.body.appendChild(overlay);
+  var input = document.getElementById('edit-title-input');
+  input.focus(); input.select();
+  function doConfirm() {
+    var newTitle = input.value.trim();
+    if (!newTitle) return;
+    document.body.removeChild(overlay);
+    var refreshBtn = card ? card.querySelector('.card-btn-refresh') : null;
+    if (refreshBtn) syncOneWithTitle(refreshBtn, filename, newTitle);
+    else fetchOne(filename, newTitle);
+  }
+  document.getElementById('edit-title-cancel').onclick = function() { document.body.removeChild(overlay); };
+  document.getElementById('edit-title-confirm').onclick = doConfirm;
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter')  doConfirm();
+    if (e.key === 'Escape') document.body.removeChild(overlay);
+  });
+  overlay.addEventListener('click', function(e) {
+    if (e.target === overlay) document.body.removeChild(overlay);
+  });
+}
+function syncOneWithTitle(btn, filename, customTitle) {
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  fetchOne(filename, customTitle).then(function(data) {
+    btn.textContent = data.ok ? '✓' : '✗';
+    btn.title = data.ok ? 'Synchronisé !' : ('Non trouvé : ' + (data.error || ''));
+    setTimeout(function(){ btn.textContent = '↺'; btn.disabled = false; btn.title = 'Re-chercher sur TMDB'; }, 3000);
+  }).catch(function(e) {
+    btn.textContent = '✗';
+    btn.title = 'Erreur : ' + e;
+    setTimeout(function(){ btn.textContent = '↺'; btn.disabled = false; btn.title = 'Re-chercher sur TMDB'; }, 3000);
+  });
 }
 
 function renderStars(rating) {
