@@ -179,15 +179,17 @@ function title_confidence($query, $result_title) {
         $s = preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $s);
         $words = preg_split('/\s+/', trim($s), -1, PREG_SPLIT_NO_EMPTY);
         $stop = array('the','a','an','de','la','le','les','du','des','et','of','in','l','d','un','une');
+        // Keep digits (episode/part numbers) and words > 2 chars
         return array_values(array_filter($words, function($w) use ($stop) {
-            return mb_strlen($w) > 2 && !in_array($w, $stop);
+            return (mb_strlen($w) > 2 || ctype_digit($w)) && !in_array($w, $stop);
         }));
     };
     $qw = $normalize($query);
     $rw = $normalize($result_title);
     if (empty($qw) || empty($rw)) return 50;
     $common = count(array_intersect($qw, $rw));
-    return (int)round(100 * $common / max(count($qw), count($rw)));
+    // Dice coefficient: less harsh than max() for sequels with long subtitles
+    return (int)round(200 * $common / (count($qw) + count($rw)));
 }
 function roman_to_arabic($s) {
     $map = array('CM'=>900,'M'=>1000,'CD'=>400,'D'=>500,'XC'=>90,'C'=>100,'XL'=>40,'L'=>50,'IX'=>9,'X'=>10,'IV'=>4,'V'=>5,'I'=>1);
@@ -420,6 +422,14 @@ if ($get_action === 'fetch_meta') {
         $parsed = parse_movie_name($search_name);
     }
     $result   = tmdb_fetch($parsed['title'], $parsed['year']);
+    // If year was used and confidence is low, retry without year — catches cases where
+    // the year in the filename is wrong (e.g. rip year ≠ release year).
+    if ($result && $parsed['year'] && isset($result['confidence']) && $result['confidence'] < 50) {
+        $result_ny = tmdb_fetch($parsed['title'], null);
+        if ($result_ny && isset($result_ny['confidence']) && $result_ny['confidence'] > $result['confidence']) {
+            $result = $result_ny;
+        }
+    }
     if ($result) {
         if (!empty($result['poster_path'])) {
             $local = poster_download($result['poster_path'], $ajax_cwd);
@@ -1479,9 +1489,10 @@ function startSync() {
   syncQueue = [];
   for (var i = 0; i < cards.length; i++) {
     var name = cards[i].getAttribute('data-name');
-    var nf   = cards[i].querySelector('.card-not-found');
-    var hasPoster = cards[i].querySelector('.card-poster');
-    if (!hasPoster) syncQueue.push(name);
+    var hasPoster   = cards[i].querySelector('.card-poster');
+    var isBadMatch  = cards[i].classList.contains('card--bad-match');
+    var isNotFound  = cards[i].querySelector('.card-not-found');
+    if (!hasPoster || isBadMatch || isNotFound) syncQueue.push(name);
   }
   if (!syncQueue.length) { alert('Toutes les métadonnées sont déjà chargées.'); return; }
   syncTotal = syncQueue.length;
