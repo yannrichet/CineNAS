@@ -192,6 +192,9 @@ function parse_movie_name($filename) {
     $title = preg_replace('/[\[\(](blu.?ray|bdrip|dvdrip|webrip|web.?dl|hdtv|hdrip|xvid|divx|x264|x265|hevc|aac|ac3|dts|multi|vf|vff|vostfr|truefrench)[^\)]*[\]\)]/i', '', $title);
     $title = preg_replace('/\.(blu.?ray|dvdrip|bdrip|webrip|web.?dl|hdtv|1080p|720p|480p|2160p|4k|xvid|x264|x265|hevc).*/i', '', $title);
     $title = preg_replace('/[\s_]+(1080p|720p|480p|2160p|4k|vff|vf|vostfr|bluray|webrip|hdtv|bdrip|dvdrip|xvid|x264|x265|hevc|aac|ac3|dts|multi|truefrench).*/i', '', $title);
+    // Strip episode/season markers: Ep07, Ep7, S01E02, but NOT "Episode" (keep for TMDB)
+    $title = preg_replace('/\bEp\d+\b/i', '', $title);
+    $title = preg_replace('/\bS\d{1,2}E\d{1,2}\b/i', '', $title);
     // Replace dots and underscores with spaces
     $title = str_replace(array('.', '_'), ' ', $title);
     // Split CamelCase
@@ -227,6 +230,11 @@ function tmdb_fetch($title, $year = null) {
     $data = json_decode($resp, true);
     if (empty($data['results'])) {
         if ($year) return tmdb_fetch($title, null);
+        // Fallback: try with only the first 4 words (handles noisy long titles)
+        $words = preg_split('/\s+/', trim($title));
+        if (count($words) > 4) {
+            return tmdb_fetch(implode(' ', array_slice($words, 0, 4)), null);
+        }
         return null;
     }
     $m = $data['results'][0];
