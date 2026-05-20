@@ -198,6 +198,15 @@ function parse_movie_name($filename) {
     $title = trim($title);
     return array('title' => $title, 'year' => $year);
 }
+// Detects multi-part naming patterns (part1/cd1/disc1/d1 …) in a filename.
+// Returns array('base'=>…, 'part'=>N) or null if not a known pattern.
+function detect_movie_parts($filename) {
+    $stem = pathinfo($filename, PATHINFO_FILENAME);
+    if (preg_match('/^(.*?)[\.\-_ ](part|cd|disc|d)(\d+)$/i', $stem, $m)) {
+        return array('base' => $m[1], 'part' => (int)$m[3]);
+    }
+    return null;
+}
 function tmdb_fetch($title, $year = null) {
     if (!FM_TMDB_API_KEY) return null;
     $query = urlencode($title);
@@ -475,6 +484,28 @@ if ($dh = opendir($cwd)) {
 usort($dirs,  function($a, $b) { return strcasecmp($a['name'], $b['name']); });
 usort($files, function($a, $b) { return $b['mtime'] - $a['mtime']; });
 
+// ── Multi-part movie grouping ─────────────────────────────────────────────────
+// Groups e.g. Movie.cd1.mkv + Movie.cd2.mkv onto a single card.
+// Secondary parts (part 2+) are stored in $parts_by_base and excluded from the
+// main loop via $skip_files; their download links appear on the primary card.
+$parts_by_base = array();
+foreach ($files as $_pf) {
+    if (!in_array($_pf['ext'], $video_ext, true)) continue;
+    $_pd = detect_movie_parts($_pf['name']);
+    if ($_pd === null) continue;
+    $_key = strtolower($_pd['base']);
+    if (!isset($parts_by_base[$_key])) $parts_by_base[$_key] = array();
+    $parts_by_base[$_key][] = array_merge($_pf, array('part_num' => $_pd['part']));
+}
+foreach (array_keys($parts_by_base) as $_key) {
+    if (count($parts_by_base[$_key]) < 2) { unset($parts_by_base[$_key]); continue; }
+    usort($parts_by_base[$_key], function($a, $b) { return $a['part_num'] - $b['part_num']; });
+}
+$skip_files = array(); // filenames of secondary parts — skipped in main loops
+foreach ($parts_by_base as $_group) {
+    for ($_i = 1; $_i < count($_group); $_i++) $skip_files[$_group[$_i]['name']] = true;
+}
+
 // ── Purge stale metadata entries (file in JSON but no longer on filesystem) ────
 if (!empty($meta_all)) {
     $fs_names = array();
@@ -689,6 +720,25 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 @media(min-width:601px) and (max-width:900px){
   #card-grid{grid-template-columns:repeat(3,1fr)!important}
 }
+/* ── Movie info modal ── */
+#movie-modal .modal{max-width:720px;padding:0;overflow:hidden}
+#movie-modal-inner{display:flex;min-height:300px}
+#movie-modal-poster{flex-shrink:0;width:220px;background:#111827;overflow:hidden}
+#movie-modal-poster img{width:100%;height:100%;object-fit:cover;display:block}
+#movie-modal-poster-ph{width:100%;min-height:330px;display:flex;align-items:center;justify-content:center;font-size:4rem;background:#111827}
+#movie-modal-info{padding:1.4rem 1.6rem;flex:1;overflow-y:auto;max-height:80vh;display:flex;flex-direction:column;gap:.6rem}
+#movie-modal-title{font-size:1.2rem;font-weight:700;color:#f9fafb;line-height:1.3}
+#movie-modal-meta{font-size:.8rem;color:#6b7280}
+#movie-modal-overview{font-size:.85rem;color:#d1d5db;line-height:1.6;flex:1;white-space:pre-wrap}
+#movie-modal-links{display:flex;gap:.5rem;flex-wrap:wrap;padding-top:.75rem;border-top:1px solid #374151;margin-top:auto}
+#movie-modal-close{padding:.65rem 1rem;border-top:1px solid #374151;display:flex;justify-content:flex-end}
+.card{cursor:context-menu}
+@media(max-width:600px){
+  #movie-modal-inner{flex-direction:column}
+  #movie-modal-poster{width:100%;max-height:240px}
+  #movie-modal-poster img{height:240px;object-fit:cover}
+  #movie-modal-info{max-height:55vh;padding:1rem}
+}
 </style>
 </head>
 <body>
@@ -741,6 +791,18 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   $m      = isset($meta_all[$item['name']]) ? $meta_all[$item['name']] : null;
   $is_vid = in_array($item['ext'], $video_ext, true);
   if (!$is_vid) continue;
+  if (isset($skip_files[$item['name']])) continue; // secondary part — shown on primary card
+  // Multi-part: collect all parts for this film (sorted by part number)
+  $_pd_card   = detect_movie_parts($item['name']);
+  $film_parts = ($_pd_card !== null && isset($parts_by_base[strtolower($_pd_card['base'])]))
+              ? $parts_by_base[strtolower($_pd_card['base'])]
+              : array();
+  // Total file size (sum of all parts, or just this file)
+  $film_bytes = $item['bytes'];
+  if (!empty($film_parts)) {
+      $film_bytes = 0;
+      foreach ($film_parts as $_fp) $film_bytes += (float)$_fp['bytes'];
+  }
   $poster = '';
   if ($m && !empty($m['poster_local'])) {
       $poster = $m['poster_local'];          // fichier local en priorité
@@ -753,8 +815,21 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   $alloc_title = ($m && !empty($m['title'])) ? $m['title'] : pathinfo($item['name'], PATHINFO_FILENAME);
   $alloc_url   = 'https://www.allocine.fr/rechercher/movie/?q=' . urlencode($alloc_title);
   $subs = isset($subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))]) ? $subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))] : array();
+  $card_meta = json_encode(array(
+    'title'        => $m && !empty($m['title'])       ? $m['title']       : pathinfo($item['name'], PATHINFO_FILENAME),
+    'year'         => $m && !empty($m['year'])         ? (int)$m['year']   : null,
+    'rating'       => $m && isset($m['rating'])        ? $m['rating']      : null,
+    'overview'     => $m && !empty($m['overview'])     ? $m['overview']    : '',
+    'poster_path'  => $m && !empty($m['poster_path'])  ? $m['poster_path'] : '',
+    'poster_local' => $m && !empty($m['poster_local']) ? $m['poster_local']: '',
+    'tmdb_url'     => $tmdb_url,
+    'alloc_url'    => $alloc_url,
+    'filename'     => $item['name'],
+    'filesize'     => fmt_size($film_bytes),
+    'parts'        => count($film_parts) > 0 ? count($film_parts) : 1,
+  ));
 ?>
-<div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>">
+<div class="card" data-name="<?php echo h($item['name']); ?>" id="card-<?php echo md5($item['name']); ?>" data-meta="<?php echo h($card_meta); ?>">
   <span class="card-watched-badge">✓ Vu</span>
   <?php if ($poster): ?>
     <img class="card-poster" src="<?php echo h($poster); ?>" alt=""<?php if (empty($m['poster_local']) && !empty($m['poster_path'])): ?> crossorigin="anonymous" data-cache-name="<?php echo h($item['name']); ?>"<?php endif; ?>>
@@ -767,9 +842,9 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   <div class="card-body">
     <div class="card-title"><?php echo $m && !empty($m['title']) ? h($m['title']) : h(pathinfo($item['name'], PATHINFO_FILENAME)); ?></div>
     <?php if ($m && !empty($m['year'])): ?>
-    <div class="card-year"><?php echo (int)$m['year']; ?> — <?php echo fmt_size($item['bytes']); ?></div>
+    <div class="card-year"><?php echo (int)$m['year']; ?> — <?php echo fmt_size($film_bytes); ?><?php if (!empty($film_parts)): ?> — <?php echo count($film_parts); ?> parties<?php endif; ?></div>
     <?php else: ?>
-    <div class="card-year"><?php echo fmt_size($item['bytes']); ?></div>
+    <div class="card-year"><?php echo fmt_size($film_bytes); ?><?php if (!empty($film_parts)): ?> — <?php echo count($film_parts); ?> parties<?php endif; ?></div>
     <?php endif; ?>
     <?php if ($m && isset($m['rating'])): ?>
     <div class="card-rating"><?php echo star_html($m['rating']); ?></div>
@@ -779,7 +854,13 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     <?php endif; ?>
   </div>
   <div class="card-footer">
+    <?php if (empty($film_parts)): ?>
     <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)">⬇ Film</a>
+    <?php else: ?>
+    <?php foreach ($film_parts as $_pi => $_part): ?>
+    <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($_part['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="<?php echo h($_part['name']); ?>">⬇ Partie <?php echo ($_pi + 1); ?></a>
+    <?php endforeach; ?>
+    <?php endif; ?>
     <?php foreach ($subs as $sub): ?>
     <a class="card-btn card-btn-sub" href="?action=download&amp;file=<?php echo urlencode($sub['rel']); ?>" title="<?php echo h($sub['name']); ?>">💬 <?php echo strtoupper($sub['ext']); ?></a>
     <?php endforeach; ?>
@@ -815,9 +896,20 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 <tbody id="tbody">
 
 <?php foreach ($files as $item):
+  if (isset($skip_files[$item['name']])) continue; // secondary part — shown on primary row
   $ptype = previewable($item['ext']);
   $m     = isset($meta_all[$item['name']]) ? $meta_all[$item['name']] : null;
   $subs  = isset($subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))]) ? $subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))] : array();
+  // Multi-part lookup for table rows
+  $_pd_row    = detect_movie_parts($item['name']);
+  $row_parts  = ($_pd_row !== null && isset($parts_by_base[strtolower($_pd_row['base'])]))
+              ? $parts_by_base[strtolower($_pd_row['base'])]
+              : array();
+  $row_bytes  = $item['bytes'];
+  if (!empty($row_parts)) {
+      $row_bytes = 0;
+      foreach ($row_parts as $_rp) $row_bytes += (float)$_rp['bytes'];
+  }
 ?>
 <tr data-name="<?php echo h($item['name']); ?>">
   <td class="col-icon"><?php echo file_icon($item['ext']); ?></td>
@@ -834,10 +926,16 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
       </small>
     <?php endif; ?>
   </td>
-  <td class="col-size" data-val="<?php echo $item['bytes']; ?>"><?php echo fmt_size($item['bytes']); ?></td>
+  <td class="col-size" data-val="<?php echo $row_bytes; ?>"><?php echo fmt_size($row_bytes); ?><?php if (!empty($row_parts)): ?> <small style="color:#6b7280">(<?php echo count($row_parts); ?>×)</small><?php endif; ?></td>
   <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
   <td class="col-actions">
-    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)">⬇</a>
+    <?php if (empty($row_parts)): ?>
+    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="⬇ Film">⬇</a>
+    <?php else: ?>
+    <?php foreach ($row_parts as $_pi => $_part): ?>
+    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($_part['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="<?php echo h($_part['name']); ?>">⬇<?php echo ($_pi + 1); ?></a>
+    <?php endforeach; ?>
+    <?php endif; ?>
     <?php foreach ($subs as $sub): ?>
     <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($sub['rel']); ?>" title="<?php echo h($sub['name']); ?>">💬</a>
     <?php endforeach; ?>
@@ -933,6 +1031,28 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
       <button type="submit" class="btn btn-danger">Delete</button>
     </div>
   </form>
+</div>
+</div>
+
+<!-- Movie info modal -->
+<div class="modal-bg" id="movie-modal" onclick="if(event.target===this)closeModal('movie-modal')">
+<div class="modal">
+  <div id="movie-modal-inner">
+    <div id="movie-modal-poster">
+      <img id="movie-modal-poster-img" src="" alt="" style="display:none">
+      <div id="movie-modal-poster-ph" style="display:none">🎬</div>
+    </div>
+    <div id="movie-modal-info">
+      <div id="movie-modal-title"></div>
+      <div id="movie-modal-meta"></div>
+      <div id="movie-modal-rating"></div>
+      <div id="movie-modal-overview"></div>
+      <div id="movie-modal-links"></div>
+    </div>
+  </div>
+  <div id="movie-modal-close">
+    <button class="btn btn-secondary" onclick="closeModal('movie-modal')">Fermer</button>
+  </div>
 </div>
 </div>
 
@@ -1278,6 +1398,73 @@ function markWatched(filename) {
   }
   // Start after a short delay to not compete with initial page render
   setTimeout(next, 2000);
+})();
+
+// ── Movie info modal ──────────────────────────────────────────────────────────
+function openMovieModal(meta) {
+  var posterImg = document.getElementById('movie-modal-poster-img');
+  var posterPh  = document.getElementById('movie-modal-poster-ph');
+  // Prefer CDN w500 for high quality; fall back to local w300
+  var posterSrc = meta.poster_path
+    ? 'https://image.tmdb.org/t/p/w500' + meta.poster_path
+    : meta.poster_local || '';
+  if (posterSrc) {
+    posterImg.src = posterSrc;
+    posterImg.style.display = '';
+    posterPh.style.display  = 'none';
+  } else {
+    posterImg.src = '';
+    posterImg.style.display = 'none';
+    posterPh.style.display  = '';
+  }
+  document.getElementById('movie-modal-title').textContent = meta.title || meta.filename;
+  var metaParts = [];
+  if (meta.year)     metaParts.push(meta.year);
+  if (meta.filesize) metaParts.push(meta.filesize);
+  if (meta.filename) metaParts.push(meta.filename);
+  document.getElementById('movie-modal-meta').textContent = metaParts.join(' — ');
+  document.getElementById('movie-modal-rating').innerHTML = meta.rating
+    ? renderStars(meta.rating)
+    : '<span class="no-rating">Pas de note</span>';
+  document.getElementById('movie-modal-overview').textContent =
+    meta.overview || 'Aucun résumé disponible.';
+  var linksHtml = '';
+  if (meta.tmdb_url)  linksHtml += '<a class="card-btn tmdb" href="' + escH(meta.tmdb_url) + '" target="_blank">TMDB</a>';
+  if (meta.alloc_url) linksHtml += '<a class="card-btn allocine" href="' + escH(meta.alloc_url) + '" target="_blank">Allociné</a>';
+  document.getElementById('movie-modal-links').innerHTML = linksHtml;
+  openModal('movie-modal');
+}
+
+// Right-click on a card
+document.addEventListener('contextmenu', function(e) {
+  var card = e.target.closest ? e.target.closest('#card-grid .card') : null;
+  if (!card) return;
+  e.preventDefault();
+  var metaStr = card.getAttribute('data-meta');
+  if (!metaStr) return;
+  try { openMovieModal(JSON.parse(metaStr)); } catch(ex) { console.warn(ex); }
+});
+
+// Long-press on a card (mobile)
+(function() {
+  var timer = null, duration = 600, target = null;
+  document.addEventListener('touchstart', function(e) {
+    var card = e.target.closest ? e.target.closest('#card-grid .card') : null;
+    if (!card) return;
+    target = card;
+    timer  = setTimeout(function() {
+      if (!target) return;
+      var metaStr = target.getAttribute('data-meta');
+      if (!metaStr) return;
+      // Prevent the tap from triggering other events after the modal opens
+      try { openMovieModal(JSON.parse(metaStr)); } catch(ex) { console.warn(ex); }
+      target = null;
+    }, duration);
+  }, {passive: true});
+  function cancel() { if (timer) { clearTimeout(timer); timer = null; } target = null; }
+  document.addEventListener('touchend',    cancel);
+  document.addEventListener('touchcancel', cancel);
+  document.addEventListener('touchmove',   cancel, {passive: true});
 })();
 
 </script>
