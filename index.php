@@ -246,8 +246,84 @@ function detect_movie_parts($filename) {
     }
     return null;
 }
+function tmdb_fetch_tv($series_title, $season, $episode, $year = null) {
+    if (!FM_TMDB_API_KEY) return null;
+    $ctx = stream_context_create(array('http' => array(
+        'timeout' => 8,
+        'ignore_errors' => true,
+        'header' => 'Authorization: Bearer ' . FM_TMDB_API_KEY . "\r\n"
+                  . 'Accept: application/json' . "\r\n",
+    )));
+    // 1. Search the TV show
+    $query = urlencode($series_title);
+    $url   = 'https://api.themoviedb.org/3/search/tv'
+           . '?query=' . $query
+           . '&language=' . FM_TMDB_LANG
+           . ($year ? '&first_air_date_year=' . $year : '');
+    $resp  = @file_get_contents($url, false, $ctx);
+    if (!$resp) return null;
+    $data  = json_decode($resp, true);
+    if (empty($data['results'])) {
+        // Retry without year
+        if ($year) return tmdb_fetch_tv($series_title, $season, $episode, null);
+        // Fallback to first 4 words
+        $words = preg_split('/\s+/', trim($series_title));
+        if (count($words) > 4) return tmdb_fetch_tv(implode(' ', array_slice($words, 0, 4)), $season, $episode, null);
+        return null;
+    }
+    $show = $data['results'][0];
+    $show_id = $show['id'];
+    // 2. Fetch episode details
+    $ep_url  = 'https://api.themoviedb.org/3/tv/' . $show_id
+             . '/season/' . $season . '/episode/' . $episode
+             . '?language=' . FM_TMDB_LANG;
+    $ep_resp = @file_get_contents($ep_url, false, $ctx);
+    $ep      = $ep_resp ? json_decode($ep_resp, true) : array();
+    if (!empty($ep['status_code'])) $ep = array(); // TMDB error (e.g. episode not found)
+    // 3. Fetch show genres (not in search results)
+    $show_url  = 'https://api.themoviedb.org/3/tv/' . $show_id . '?language=' . FM_TMDB_LANG;
+    $show_resp = @file_get_contents($show_url, false, $ctx);
+    $show_full = $show_resp ? json_decode($show_resp, true) : array();
+    $genre_ids = array();
+    if (!empty($show_full['genres'])) {
+        foreach ($show_full['genres'] as $g) $genre_ids[] = $g['id'];
+    }
+    // Episode poster (still image) > series poster
+    $poster_path = '';
+    if (!empty($ep['still_path']))  $poster_path = $ep['still_path'];
+    elseif (!empty($show['poster_path'])) $poster_path = $show['poster_path'];
+    // Episode title and overview fall back to series
+    $ep_title    = !empty($ep['name'])     ? $ep['name']     : '';
+    $ep_overview = !empty($ep['overview']) ? $ep['overview'] : (isset($show['overview']) ? $show['overview'] : '');
+    $air_year    = !empty($ep['air_date']) ? (int)substr($ep['air_date'], 0, 4)
+                 : (!empty($show['first_air_date']) ? (int)substr($show['first_air_date'], 0, 4) : $year);
+    $show_name   = isset($show['name']) ? $show['name'] : $series_title;
+    // Build display title: "Show Name — S01E03 · Episode Title"
+    $ep_code = sprintf('S%02dE%02d', $season, $episode);
+    $display_title = $ep_title ? $show_name . ' ' . $ep_code . ' · ' . $ep_title : $show_name . ' ' . $ep_code;
+    return array(
+        'tmdb_id'     => $show_id,
+        'is_tv'       => true,
+        'season'      => $season,
+        'episode'     => $episode,
+        'title'       => $display_title,
+        'show_title'  => $show_name,
+        'ep_title'    => $ep_title,
+        'orig_title'  => isset($show['original_name']) ? $show['original_name'] : '',
+        'year'        => $air_year,
+        'poster_path' => $poster_path,
+        'rating'      => isset($show['vote_average']) ? round($show['vote_average'], 1) : null,
+        'votes'       => isset($show['vote_count'])   ? $show['vote_count'] : 0,
+        'overview'    => $ep_overview,
+        'genre_ids'   => $genre_ids,
+        'fetched_at'  => time(),
+        'confidence'  => 100,
+    );
+}
+
 function tmdb_fetch($title, $year = null) {
     if (!FM_TMDB_API_KEY) return null;
+
     $query = urlencode($title);
     $url   = 'https://api.themoviedb.org/3/search/movie'
            . '?query=' . $query
@@ -422,10 +498,24 @@ if ($get_action === 'fetch_meta') {
             : $filename;
         $parsed = parse_movie_name($search_name);
     }
-    $result   = tmdb_fetch($parsed['title'], $parsed['year']);
-    // If year was used and confidence is low, retry without year — catches cases where
-    // the year in the filename is wrong (e.g. rip year ≠ release year).
-    if ($result && $parsed['year'] && isset($result['confidence']) && $result['confidence'] < 50) {
+
+    // ── Route: TV episode (SxxExx in filename) vs movie ──────────────────────
+    $is_tv_ep = preg_match('/\bS(\d{1,2})E(\d{1,2})\b/i', $filename, $_se_m);
+    if ($is_tv_ep && !$custom_title) {
+        $tv_season  = (int)$_se_m[1];
+        $tv_episode = (int)$_se_m[2];
+        // Extract series title: everything before the SxxExx marker
+        $stem_tv = pathinfo($filename, PATHINFO_FILENAME);
+        $stem_tv = preg_replace('/\bS\d{1,2}E\d{1,2}.*/i', '', $stem_tv);
+        $stem_tv = str_replace(array('.', '_'), ' ', $stem_tv);
+        $stem_tv = preg_replace('/([a-z])([A-Z])/', '$1 $2', $stem_tv);
+        $stem_tv = trim(preg_replace('/\s{2,}/', ' ', $stem_tv));
+        $result  = tmdb_fetch_tv($stem_tv, $tv_season, $tv_episode, $parsed['year']);
+    } else {
+        $result = tmdb_fetch($parsed['title'], $parsed['year']);
+    }
+    // If year was used and confidence is low, retry without year (movies only)
+    if (!$is_tv_ep && $result && $parsed['year'] && isset($result['confidence']) && $result['confidence'] < 50) {
         $result_ny = tmdb_fetch($parsed['title'], null);
         if ($result_ny && isset($result_ny['confidence']) && $result_ny['confidence'] > $result['confidence']) {
             $result = $result_ny;
