@@ -50,6 +50,8 @@ function csrf_check() {
 
 // ── Auth ───────────────────────────────────────────────────────────────────────
 function authed() { return !empty($_SESSION['fm']); }
+function strm_token($rel) { return hash_hmac('sha256', $rel, FM_PASSWORD_HASH); }
+function strm_token_valid($rel, $tok) { return hash_equals(strm_token($rel), (string)$tok); }
 
 $login_error = null;
 if (isset($_POST['_login'])) {
@@ -68,6 +70,22 @@ if (isset($_GET['logout'])) {
     $redirect = strtok($_SERVER['REQUEST_URI'], '?');
     header('Location: ' . $redirect);
     exit;
+}
+// Token-authenticated download (for .strm / VLC — no session needed)
+if (isset($_GET['action']) && $_GET['action'] === 'download'
+    && isset($_GET['token']) && isset($_GET['file'])) {
+    $rel = $_GET['file'];
+    if (strm_token_valid($rel, $_GET['token'])) {
+        $f = jail($rel);
+        if ($f && is_file($f)) {
+            header('Content-Type: application/octet-stream');
+            header('Content-Disposition: attachment; filename="' . addslashes(basename($f)) . '"');
+            header('Content-Length: ' . filesize($f));
+            header('Cache-Control: no-cache');
+            readfile($f); exit;
+        }
+    }
+    http_response_code(403); exit;
 }
 if (!authed()) { render_login($login_error); exit; }
 
@@ -423,6 +441,26 @@ if ($get_action === 'download') {
         header('Content-Length: ' . filesize($f));
         header('Cache-Control: no-cache');
         readfile($f); exit;
+    }
+    http_response_code(404); exit;
+}
+if ($get_action === 'strm') {
+    $rel = isset($_GET['file']) ? $_GET['file'] : '';
+    $f   = jail($rel);
+    if ($f && is_file($f)) {
+        $scheme   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host     = $_SERVER['HTTP_HOST'];
+        $script   = $_SERVER['SCRIPT_NAME'];
+        $token    = strm_token($rel);
+        $file_url = $scheme . '://' . $host . $script
+                  . '?action=download&file=' . urlencode($rel)
+                  . '&token=' . $token;
+        $strm_name = pathinfo(basename($f), PATHINFO_FILENAME) . '.strm';
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . addslashes($strm_name) . '"');
+        header('Cache-Control: no-cache');
+        echo $file_url;
+        exit;
     }
     http_response_code(404); exit;
 }
@@ -897,6 +935,8 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 .card-btn-watch{background:#374151;color:#9ca3af}
 .card-btn-watch.active{background:#166534!important;color:#86efac!important}
 .card-btn-watch.active:hover{background:#15803d!important}
+.card-btn-play{background:#166534;color:#86efac;font-weight:600}
+.card-btn-play:hover{background:#15803d;color:#dcfce7}
 .card.watched{opacity:.55;transition:.2s}
 .card.watched:hover{opacity:.85}
 .card-watched-badge{display:none;position:absolute;top:6px;left:6px;background:rgba(22,101,52,.9);
@@ -1167,9 +1207,11 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   </div>
   <div class="card-footer">
     <?php if (empty($film_parts)): ?>
+    <a class="card-btn card-btn-play" href="?action=strm&amp;file=<?php echo urlencode($item['rel']); ?>" title="Lire dans VLC/Kodi/Infuse (.strm)">▶ Lire</a>
     <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)">⬇ Film</a>
     <?php else: ?>
     <?php foreach ($film_parts as $_pi => $_part): ?>
+    <a class="card-btn card-btn-play" href="?action=strm&amp;file=<?php echo urlencode($_part['rel']); ?>" title="Lire partie <?php echo ($_pi+1); ?> dans VLC/Kodi/Infuse">▶<?php echo ($_pi+1); ?></a>
     <a class="card-btn" href="?action=download&amp;file=<?php echo urlencode($_part['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="<?php echo h($_part['name']); ?>">⬇ Partie <?php echo ($_pi + 1); ?></a>
     <?php endforeach; ?>
     <?php endif; ?>
@@ -1256,9 +1298,11 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
   <td class="col-actions">
     <?php if (empty($row_parts)): ?>
+    <a class="btn btn-primary btn-sm" href="?action=strm&amp;file=<?php echo urlencode($item['rel']); ?>" title="Lire dans VLC/Kodi/Infuse (.strm)">▶</a>
     <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="⬇ Film">⬇</a>
     <?php else: ?>
     <?php foreach ($row_parts as $_pi => $_part): ?>
+    <a class="btn btn-primary btn-sm" href="?action=strm&amp;file=<?php echo urlencode($_part['rel']); ?>" title="Lire partie <?php echo ($_pi+1); ?>">▶<?php echo ($_pi+1); ?></a>
     <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($_part['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="<?php echo h($_part['name']); ?>">⬇<?php echo ($_pi + 1); ?></a>
     <?php endforeach; ?>
     <?php endif; ?>
