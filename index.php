@@ -179,6 +179,26 @@ function posters_url_for($dir)  {
     return $base . '.posters/';
 }
 
+// ── Scan cache (avoids rescanning FM_ROOT + reloading every .movies_meta.json
+//    on every single page load) ───────────────────────────────────────────────
+define('SCAN_CACHE_FILE', FM_ROOT . DIRECTORY_SEPARATOR . '.scan_cache.json');
+define('SCAN_CACHE_TTL',  60); // seconds; also invalidated immediately by scan_cache_clear()
+
+function scan_cache_load() {
+    if (!file_exists(SCAN_CACHE_FILE)) return null;
+    if (time() - filemtime(SCAN_CACHE_FILE) > SCAN_CACHE_TTL) return null;
+    $raw = @file_get_contents(SCAN_CACHE_FILE);
+    if ($raw === false) return null;
+    $data = json_decode($raw, true);
+    return is_array($data) ? $data : null;
+}
+function scan_cache_save($data) {
+    @file_put_contents(SCAN_CACHE_FILE, json_encode($data), LOCK_EX);
+}
+function scan_cache_clear() {
+    @unlink(SCAN_CACHE_FILE);
+}
+
 // ── Movie metadata ─────────────────────────────────────────────────────────────
 function meta_load($dir) {
     $f = meta_file_for($dir);
@@ -505,6 +525,7 @@ if ($get_action === 'cache_poster' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if (file_exists($local_path)) {
         $meta[$filename]['poster_local'] = posters_url_for($ajax_cwd) . $local_name;
         meta_save($meta, $ajax_cwd);
+        scan_cache_clear();
         echo '{"ok":true}';
     } else { echo '{"ok":false}'; }
     exit;
@@ -567,11 +588,13 @@ if ($get_action === 'fetch_meta') {
         if ($custom_title) $result['custom_title'] = $custom_title;
         $meta[$filename] = $result;
         meta_save($meta, $ajax_cwd);
+        scan_cache_clear();
         ob_clean(); header('Content-Type: application/json');
         echo json_encode(array('ok' => true, 'data' => $result));
     } else {
         $meta[$filename] = array('not_found' => true, 'fetched_at' => time());
         meta_save($meta, $ajax_cwd);
+        scan_cache_clear();
         ob_clean(); header('Content-Type: application/json');
         echo json_encode(array('ok' => false, 'error' => 'Not found on TMDB'));
     }
@@ -601,6 +624,7 @@ if ($get_action === 'rename_file') {
     if (!file_exists($old_path)) { echo json_encode(array('ok'=>false,'error'=>'Fichier introuvable')); exit; }
     if (file_exists($new_path))  { echo json_encode(array('ok'=>false,'error'=>'Un fichier avec ce nom existe déjà')); exit; }
     if (!@rename($old_path, $new_path)) { echo json_encode(array('ok'=>false,'error'=>'Renommage impossible')); exit; }
+    scan_cache_clear();
     // Move meta entry to new key
     $meta = meta_load($ajax_cwd);
     if (isset($meta[$oldname])) {
@@ -620,12 +644,14 @@ if ($get_action === 'delete_meta') {
         $meta = meta_load($ajax_cwd);
         unset($meta[$filename]);
         meta_save($meta, $ajax_cwd);
+        scan_cache_clear();
     }
     echo json_encode(array('ok' => true)); exit;
 }
 
 if (!FM_DEMO_MODE && $_SERVER['REQUEST_METHOD'] === 'POST') {
     csrf_check();
+    scan_cache_clear(); // upload/mkdir/delete/rename all change the file tree
     $cwd     = current_dir();
     $cwd_rel = relpath($cwd);
 
@@ -695,7 +721,8 @@ $video_ext    = array('mkv','mp4','avi','mov','wmv','flv','mpg','mpeg','m4v','3g
 $subtitle_ext = array('srt','sub','ass','ssa','vtt');
 $ignore      = array('.', '..', basename(__FILE__), '.DS_Store', 'Thumbs.db',
                  '.movies_meta.json', '.posters', '.@__thumb', '.@__qini', '@Transcode', '.deletedByTMM',
-                 'listr.css', 'listr-favicon.png', 'index.php_old', 'filemanager.php');
+                 'listr.css', 'listr-favicon.png', 'index.php_old', 'filemanager.php',
+                 basename(SCAN_CACHE_FILE));
 $ignore_ext  = array('php', 'php3', 'php4', 'php5', 'phtml', 'sh', 'bash', 'py', 'pl', 'rb');
 $all_files    = array();
 $subs_by_base = array();
@@ -740,8 +767,22 @@ function do_scan_recursive($dir, $tag) {
     }
     closedir($dh);
 }
-do_scan_recursive(FM_ROOT, '');
-usort($all_files, function($a, $b) { return $b['mtime'] - $a['mtime']; });
+$_scan_cached = scan_cache_load();
+if ($_scan_cached !== null) {
+    $all_files    = $_scan_cached['all_files'];
+    $subs_by_base = $_scan_cached['subs_by_base'];
+    $total_bytes  = $_scan_cached['total_bytes'];
+    $meta_by_dir  = $_scan_cached['meta_by_dir'];
+} else {
+    do_scan_recursive(FM_ROOT, '');
+    usort($all_files, function($a, $b) { return $b['mtime'] - $a['mtime']; });
+    scan_cache_save(array(
+        'all_files'    => $all_files,
+        'subs_by_base' => $subs_by_base,
+        'total_bytes'  => $total_bytes,
+        'meta_by_dir'  => $meta_by_dir,
+    ));
+}
 $files = $all_files; // alias used in templates
 
 // Collect unique sorted tags
@@ -1148,6 +1189,9 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   $_card_genre_ids = ($m && !empty($m['genre_ids'])) ? $m['genre_ids'] : array();
   $_card_rating    = ($m && isset($m['rating'])) ? (float)$m['rating'] : 0;
   $_card_dir_rel   = ltrim(str_replace(DIRECTORY_SEPARATOR, '/', ltrim(substr($item['dir'], strlen(FM_ROOT)), DIRECTORY_SEPARATOR)), '/');
+  $_card_ptype     = previewable($item['ext']);
+  // Table view is built client-side from this data (see buildTableFromCards() in <script>)
+  // instead of being rendered a second time server-side — avoids doubling the PHP render cost.
   $card_meta = json_encode(array(
     'title'        => $m && !empty($m['title'])       ? $m['title']       : pathinfo($item['name'], PATHINFO_FILENAME),
     'year'         => $m && !empty($m['year'])         ? (int)$m['year']   : null,
@@ -1159,7 +1203,15 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
     'alloc_url'    => $alloc_url,
     'filename'     => $item['name'],
     'filesize'     => fmt_size($film_bytes),
+    'bytes'        => $film_bytes,
+    'mtime'        => $item['mtime'],
+    'date_disp'    => date('Y-m-d H:i', $item['mtime']),
+    'icon'         => file_icon($item['ext']),
+    'ptype'        => $_card_ptype,
+    'has_title'    => (bool)($m && !empty($m['title'])),
     'parts'        => count($film_parts) > 0 ? count($film_parts) : 1,
+    'parts_detail' => array_map(function($p) { return array('rel' => $p['rel'], 'name' => $p['name']); }, $film_parts),
+    'subs'         => array_map(function($s) { return array('rel' => $s['rel'], 'name' => $s['name'], 'ext' => $s['ext']); }, $subs),
     'genre_ids'    => $_card_genre_ids,
     'tag'          => $item['tag'],
   ));
@@ -1249,75 +1301,8 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   </tr>
 </thead>
 <tbody id="tbody">
-
-<?php foreach ($files as $item):
-  if (!in_array($item['ext'], $video_ext, true)) continue;
-  if (isset($skip_files[$item['rel']])) continue; // secondary part — shown on primary row
-  $ptype = previewable($item['ext']);
-  $m     = isset($meta_by_dir[$item['dir']][$item['name']]) ? $meta_by_dir[$item['dir']][$item['name']] : null;
-  $subs  = isset($subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))]) ? $subs_by_base[strtolower(pathinfo($item['name'], PATHINFO_FILENAME))] : array();
-  // Multi-part lookup for table rows
-  $_pd_row    = detect_movie_parts($item['name']);
-  $_row_key   = ($_pd_row !== null) ? ($item['dir'] . '|' . strtolower($_pd_row['base'])) : null;
-  $row_parts  = ($_row_key !== null && isset($parts_by_base[$_row_key]))
-              ? $parts_by_base[$_row_key]
-              : array();
-  $row_bytes  = $item['bytes'];
-  if (!empty($row_parts)) {
-      $row_bytes = 0;
-      foreach ($row_parts as $_rp) $row_bytes += (float)$_rp['bytes'];
-  }
-  $_row_rating    = ($m && isset($m['rating'])) ? (float)$m['rating'] : 0;
-  $_row_genre_ids = ($m && !empty($m['genre_ids'])) ? $m['genre_ids'] : array();
-?>
-<tr data-name="<?php echo h($item['name']); ?>"
-    data-rel="<?php echo h($item['rel']); ?>"
-    data-tag="<?php echo h($item['tag']); ?>"
-    data-rating="<?php echo $_row_rating; ?>"
-    data-genre-ids="<?php echo h(json_encode($_row_genre_ids)); ?>">
-  <td class="col-icon"><?php echo file_icon($item['ext']); ?></td>
-  <td class="col-name" data-val="<?php echo h($item['name']); ?>">
-    <?php if ($ptype): ?>
-      <a href="#" onclick="openPreview(<?php echo json_encode($item['rel']); ?>,<?php echo json_encode($item['name']); ?>,<?php echo json_encode($ptype); ?>);return false"><?php echo h($item['name']); ?></a>
-    <?php else: ?>
-      <a href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>"><?php echo h($item['name']); ?></a>
-    <?php endif; ?>
-    <?php if ($m && !empty($m['title'])): ?>
-      <br><small style="color:#9ca3af"><?php echo h($m['title']); ?>
-      <?php if (!empty($m['year'])): ?>(<?php echo (int)$m['year']; ?>)<?php endif; ?>
-      <?php if (isset($m['rating'])): ?>— <?php echo $m['rating']; ?>/10<?php endif; ?>
-      </small>
-    <?php endif; ?>
-  </td>
-  <td class="col-tag">
-    <?php if ($item['tag'] !== ''): ?>
-    <span class="tag-badge" onclick="setTagFilter(<?php echo h(json_encode($item['tag'])); ?>)" title="Filtrer par ce tag"><?php echo h($item['tag']); ?></span>
-    <?php endif; ?>
-  </td>
-  <td class="col-size" data-val="<?php echo $row_bytes; ?>"><?php echo fmt_size($row_bytes); ?><?php if (!empty($row_parts)): ?> <small style="color:#6b7280">(<?php echo count($row_parts); ?>×)</small><?php endif; ?></td>
-  <td class="col-date" data-val="<?php echo $item['mtime']; ?>"><?php echo date('Y-m-d H:i', $item['mtime']); ?></td>
-  <td class="col-actions">
-    <?php if (empty($row_parts)): ?>
-    <a class="btn btn-primary btn-sm" href="?action=strm&amp;file=<?php echo urlencode($item['rel']); ?>" title="Lire dans VLC/Kodi/Infuse (.strm)">▶</a>
-    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($item['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="⬇ Film">⬇</a>
-    <?php else: ?>
-    <?php foreach ($row_parts as $_pi => $_part): ?>
-    <a class="btn btn-primary btn-sm" href="?action=strm&amp;file=<?php echo urlencode($_part['rel']); ?>" title="Lire partie <?php echo ($_pi+1); ?>">▶<?php echo ($_pi+1); ?></a>
-    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($_part['rel']); ?>" onclick="markWatched(<?php echo h(json_encode($item['name'])); ?>)" title="<?php echo h($_part['name']); ?>">⬇<?php echo ($_pi + 1); ?></a>
-    <?php endforeach; ?>
-    <?php endif; ?>
-    <?php foreach ($subs as $sub): ?>
-    <a class="btn btn-secondary btn-sm" href="?action=download&amp;file=<?php echo urlencode($sub['rel']); ?>" title="<?php echo h($sub['name']); ?>">💬</a>
-    <?php endforeach; ?>
-    <?php if ($ptype): ?>
-    <button class="btn btn-secondary btn-sm"
-      onclick="openPreview(<?php echo h(json_encode($item['rel'])); ?>,<?php echo h(json_encode($item['name'])); ?>,<?php echo h(json_encode($ptype)); ?>)">▶</button>
-    <?php endif; ?>
-    <button class="btn btn-secondary btn-sm btn-watch-row" onclick="toggleWatched(this,<?php echo h(json_encode($item['name'])); ?>)" title="Marquer comme vu">👁</button>
-  </td>
-</tr>
-<?php endforeach; ?>
-
+<!-- Rows are built client-side by buildTableFromCards() from the #card-grid .card
+     data-meta already sent above — avoids rendering every file a second time in PHP. -->
 </tbody>
 </table>
 <?php endif; ?>
@@ -1440,6 +1425,88 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
 </div>
 
 <script>
+// ── Build the table view from the card grid's data-meta ──────────────────────
+// The server renders each film once (as a .card in #card-grid); the table view
+// is derived from that same data client-side instead of being rendered a
+// second time in PHP, so the page doesn't ship (and the server doesn't build)
+// duplicate markup for every file.
+function escAttr(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                   .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function buildTableFromCards() {
+  var tbody = document.getElementById('tbody');
+  if (!tbody) return;
+  var cards = document.querySelectorAll('#card-grid .card');
+  var html = '';
+  for (var i = 0; i < cards.length; i++) {
+    var card = cards[i];
+    var name   = card.getAttribute('data-name') || '';
+    var rel    = card.getAttribute('data-rel')  || '';
+    var tag    = card.getAttribute('data-tag')  || '';
+    var rating = card.getAttribute('data-rating') || '0';
+    var gids   = card.getAttribute('data-genre-ids') || '[]';
+    var meta = {}; try { meta = JSON.parse(card.getAttribute('data-meta') || '{}'); } catch(e) {}
+    var parts = meta.parts_detail || [];
+    var subs  = meta.subs || [];
+
+    var nameCell;
+    if (meta.ptype) {
+      nameCell = '<a href="#" onclick="openPreview(' + escAttr(JSON.stringify(rel)) + ',' +
+                 escAttr(JSON.stringify(name)) + ',' + escAttr(JSON.stringify(meta.ptype)) +
+                 ');return false">' + escAttr(name) + '</a>';
+    } else {
+      nameCell = '<a href="?action=download&file=' + encodeURIComponent(rel) + '">' + escAttr(name) + '</a>';
+    }
+    if (meta.has_title) {
+      nameCell += '<br><small style="color:#9ca3af">' + escAttr(meta.title) +
+        (meta.year ? ' (' + meta.year + ')' : '') +
+        (meta.rating !== null && meta.rating !== undefined ? ' — ' + meta.rating + '/10' : '') +
+        '</small>';
+    }
+
+    var tagCell = tag !== ''
+      ? '<span class="tag-badge" onclick="setTagFilter(' + escAttr(JSON.stringify(tag)) + ')" title="Filtrer par ce tag">' + escAttr(tag) + '</span>'
+      : '';
+
+    var sizeSuffix = parts.length > 0 ? ' <small style="color:#6b7280">(' + parts.length + '×)</small>' : '';
+
+    var actions = '';
+    if (parts.length > 0) {
+      for (var pi = 0; pi < parts.length; pi++) {
+        var p = parts[pi];
+        actions += '<a class="btn btn-primary btn-sm" href="?action=strm&file=' + encodeURIComponent(p.rel) + '" title="Lire partie ' + (pi+1) + '">▶' + (pi+1) + '</a>';
+        actions += '<a class="btn btn-secondary btn-sm" href="?action=download&file=' + encodeURIComponent(p.rel) + '" onclick="markWatched(' + escAttr(JSON.stringify(name)) + ')" title="' + escAttr(p.name) + '">⬇' + (pi+1) + '</a>';
+      }
+    } else {
+      actions += '<a class="btn btn-primary btn-sm" href="?action=strm&file=' + encodeURIComponent(rel) + '" title="Lire dans VLC/Kodi/Infuse (.strm)">▶</a>';
+      actions += '<a class="btn btn-secondary btn-sm" href="?action=download&file=' + encodeURIComponent(rel) + '" onclick="markWatched(' + escAttr(JSON.stringify(name)) + ')" title="⬇ Film">⬇</a>';
+    }
+    for (var si = 0; si < subs.length; si++) {
+      var s = subs[si];
+      actions += '<a class="btn btn-secondary btn-sm" href="?action=download&file=' + encodeURIComponent(s.rel) + '" title="' + escAttr(s.name) + '">💬</a>';
+    }
+    if (meta.ptype) {
+      actions += '<button class="btn btn-secondary btn-sm" onclick="openPreview(' +
+        escAttr(JSON.stringify(rel)) + ',' + escAttr(JSON.stringify(name)) + ',' + escAttr(JSON.stringify(meta.ptype)) +
+        ')">▶</button>';
+    }
+    actions += '<button class="btn btn-secondary btn-sm btn-watch-row" onclick="toggleWatched(this,' + escAttr(JSON.stringify(name)) + ')" title="Marquer comme vu">👁</button>';
+
+    html += '<tr data-name="' + escAttr(name) + '" data-rel="' + escAttr(rel) + '" data-tag="' + escAttr(tag) +
+      '" data-rating="' + escAttr(rating) + '" data-genre-ids="' + escAttr(gids) + '">' +
+      '<td class="col-icon">' + (meta.icon || '🎬') + '</td>' +
+      '<td class="col-name" data-val="' + escAttr(name) + '">' + nameCell + '</td>' +
+      '<td class="col-tag">' + tagCell + '</td>' +
+      '<td class="col-size" data-val="' + (meta.bytes || 0) + '">' + escAttr(meta.filesize || '') + sizeSuffix + '</td>' +
+      '<td class="col-date" data-val="' + (meta.mtime || 0) + '">' + escAttr(meta.date_disp || '') + '</td>' +
+      '<td class="col-actions">' + actions + '</td>' +
+      '</tr>';
+  }
+  tbody.innerHTML = html;
+}
+buildTableFromCards();
+
 function openModal(id) {
   document.getElementById(id).className += ' open';
   var f = document.querySelector('#'+id+' input:not([type=hidden])');
