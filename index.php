@@ -1391,6 +1391,7 @@ th.sorted-desc .si::after{content:'↓';opacity:1}
   <span>🎬 <strong>CineNAS</strong> — <a href="https://github.com/yannrichet/CineNAS" target="_blank" rel="noopener" style="color:#6366f1;text-decoration:none">github.com/yannrichet/CineNAS</a><?php echo FM_DEMO_MODE ? ' — <em>Read-only mode</em>' : ''; ?></span>
   <span id="visible-count" style="color:#6b7280;font-size:.78rem"></span>
   <span><?php echo count($all_files); ?> films au total</span>
+  <span style="color:#6b7280;font-size:.78rem">maj <?php echo date('d/m/Y H:i', filemtime(__FILE__)); ?></span>
 </div>
 </div>
 
