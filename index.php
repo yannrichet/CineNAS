@@ -78,11 +78,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'download'
     if (strm_token_valid($rel, $_GET['token'])) {
         $f = jail($rel);
         if ($f && is_file($f)) {
-            header('Content-Type: application/octet-stream');
-            header('Content-Disposition: attachment; filename="' . addslashes(basename($f)) . '"');
-            header('Content-Length: ' . filesize($f));
-            header('Cache-Control: no-cache');
-            readfile($f); exit;
+            fm_send_file($f, 'application/octet-stream',
+                'Content-Disposition: attachment; filename="' . addslashes(basename($f)) . '"');
         }
     }
     http_response_code(403); exit;
@@ -133,6 +130,67 @@ function fmt_size($bytes) {
     if ($b >= 1048576)    return round($b / 1048576, 1)    . ' MB';
     if ($b >= 1024)       return round($b / 1024, 1)       . ' KB';
     return $b . ' B';
+}
+// filesize() overflows to a negative/wrapped int for files >2GB on 32-bit PHP builds,
+// which corrupts the Content-Length header sent to the browser/VLC and truncates
+// downloads. clearstatcache() avoids a stale cached size, sprintf('%u', ...) undoes
+// the 32-bit wraparound.
+function fm_filesize($f) {
+    clearstatcache(true, $f);
+    return sprintf('%u', (int)filesize($f));
+}
+// Stream a file with HTTP Range support (RFC 7233). Without this, browsers doing
+// resumable/parallel downloads and players seeking (VLC) send Range requests that
+// were previously ignored — the server always replied with the *whole* file from
+// byte 0 with a 200 status, so the client's range-based reassembly ended up with a
+// truncated/wrong-size file regardless of how big it was.
+function fm_send_file($path, $mime, $disposition_header, $cache_control = 'no-cache') {
+    clearstatcache(true, $path);
+    $size = filesize($path);
+    $fp   = fopen($path, 'rb');
+    if ($size === false || !$fp) { http_response_code(404); exit; }
+
+    $start = 0;
+    $end   = $size - 1;
+    $status = 200;
+
+    if (isset($_SERVER['HTTP_RANGE']) && preg_match('/bytes=(\d*)-(\d*)/', $_SERVER['HTTP_RANGE'], $m)) {
+        $has_start = ($m[1] !== '');
+        $has_end   = ($m[2] !== '');
+        if ($has_start) { $start = (int)$m[1]; }
+        if ($has_end)   { $end = (int)$m[2]; }
+        elseif ($has_start) { $end = $size - 1; }
+        else { // suffix range: bytes=-N
+            $start = max(0, $size - (int)$m[2]);
+            $end   = $size - 1;
+        }
+        if ($start > $end || $start >= $size || $end >= $size) {
+            header('Content-Range: bytes */' . $size);
+            http_response_code(416);
+            fclose($fp); exit;
+        }
+        $status = 206;
+    }
+
+    http_response_code($status);
+    header('Accept-Ranges: bytes');
+    header('Content-Type: ' . $mime);
+    header($disposition_header);
+    header('Content-Length: ' . ($end - $start + 1));
+    if ($status === 206) header('Content-Range: bytes ' . $start . '-' . $end . '/' . $size);
+    header('Cache-Control: ' . $cache_control);
+
+    fseek($fp, $start);
+    $remaining = $end - $start + 1;
+    $chunk = 1048576;
+    while ($remaining > 0 && !feof($fp)) {
+        $read = ($remaining > $chunk) ? $chunk : $remaining;
+        echo fread($fp, $read);
+        flush();
+        $remaining -= $read;
+    }
+    fclose($fp);
+    exit;
 }
 function file_icon($ext) {
     $map = array(
@@ -456,11 +514,8 @@ $get_action = isset($_GET['action']) ? $_GET['action'] : '';
 if ($get_action === 'download') {
     $f = jail(isset($_GET['file']) ? $_GET['file'] : '');
     if ($f && is_file($f)) {
-        header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . addslashes(basename($f)) . '"');
-        header('Content-Length: ' . filesize($f));
-        header('Cache-Control: no-cache');
-        readfile($f); exit;
+        fm_send_file($f, 'application/octet-stream',
+            'Content-Disposition: attachment; filename="' . addslashes(basename($f)) . '"');
     }
     http_response_code(404); exit;
 }
@@ -499,10 +554,7 @@ if ($get_action === 'preview') {
             'pdf'=>'application/pdf',
         );
         $mime = isset($mime_map[$ext]) ? $mime_map[$ext] : 'application/octet-stream';
-        header('Content-Type: ' . $mime);
-        header('Content-Length: ' . filesize($f));
-        header('Cache-Control: max-age=3600');
-        readfile($f); exit;
+        fm_send_file($f, $mime, 'Content-Disposition: inline', 'max-age=3600');
     }
     http_response_code(404); exit;
 }
