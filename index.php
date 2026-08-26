@@ -139,6 +139,30 @@ function fm_filesize($f) {
     clearstatcache(true, $f);
     return sprintf('%u', (int)filesize($f));
 }
+// Fresh (non-cached) size for a file in $dir, summing multi-part siblings
+// (Movie.CD1.mkv + Movie.CD2.mkv) the same way the main listing does. Used to
+// report an up-to-date size right after a manual TMDB re-sync, since the
+// scan cache it invalidates only takes effect on the next full page load.
+function fm_current_filesize($dir, $filename) {
+    $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    $pd  = detect_movie_parts($filename);
+    if ($pd === null) {
+        return (float)fm_filesize($dir . DIRECTORY_SEPARATOR . $filename);
+    }
+    $total = 0.0;
+    $dh = @opendir($dir);
+    if ($dh) {
+        while (($e = readdir($dh)) !== false) {
+            if (strtolower(pathinfo($e, PATHINFO_EXTENSION)) !== $ext) continue;
+            $epd = detect_movie_parts($e);
+            if ($epd && $epd['base'] === $pd['base']) {
+                $total += (float)fm_filesize($dir . DIRECTORY_SEPARATOR . $e);
+            }
+        }
+        closedir($dh);
+    }
+    return $total;
+}
 // Stream a file with HTTP Range support (RFC 7233). Without this, browsers doing
 // resumable/parallel downloads and players seeking (VLC) send Range requests that
 // were previously ignored — the server always replied with the *whole* file from
@@ -632,6 +656,7 @@ if ($get_action === 'fetch_meta') {
             $result = $result_ny;
         }
     }
+    $fresh_bytes = fm_current_filesize($ajax_cwd, $filename);
     if ($result) {
         if (!empty($result['poster_path'])) {
             $local = poster_download($result['poster_path'], $ajax_cwd);
@@ -641,6 +666,8 @@ if ($get_action === 'fetch_meta') {
         $meta[$filename] = $result;
         meta_save($meta, $ajax_cwd);
         scan_cache_clear();
+        $result['bytes']    = $fresh_bytes;
+        $result['filesize'] = fmt_size($fresh_bytes);
         ob_clean(); header('Content-Type: application/json');
         echo json_encode(array('ok' => true, 'data' => $result));
     } else {
@@ -648,7 +675,7 @@ if ($get_action === 'fetch_meta') {
         meta_save($meta, $ajax_cwd);
         scan_cache_clear();
         ob_clean(); header('Content-Type: application/json');
-        echo json_encode(array('ok' => false, 'error' => 'Not found on TMDB'));
+        echo json_encode(array('ok' => false, 'error' => 'Not found on TMDB', 'bytes' => $fresh_bytes, 'filesize' => fmt_size($fresh_bytes)));
     }
     exit;
 }
@@ -1867,9 +1894,11 @@ function refreshCard(card, filename, d) {
   // Update body
   var body = card.querySelector('.card-body');
   if (body) {
-    var sizeText = '';
-    var yr = body.querySelector('.card-year');
-    if (yr) { var parts = yr.textContent.split('—'); sizeText = parts.length > 1 ? parts[1].trim() : ''; }
+    var sizeText = d.filesize || '';
+    if (!sizeText) {
+      var yr = body.querySelector('.card-year');
+      if (yr) { var parts = yr.textContent.split('—'); sizeText = parts.length > 1 ? parts[1].trim() : ''; }
+    }
     var stars = d.rating ? '<div class="card-rating">' + renderStars(d.rating) + '</div>' : '';
     var ov    = d.overview ? '<div class="card-overview">' + escH(d.overview) + '</div>' : '';
     body.innerHTML = '<div class="card-title">' + escH(d.title || filename) + '</div>'
@@ -1884,6 +1913,7 @@ function refreshCard(card, filename, d) {
   meta.overview = d.overview || '';
   meta.poster_path = d.poster_path || '';
   meta.poster_local = d.poster_local || '';
+  if (d.filesize) { meta.filesize = d.filesize; meta.bytes = d.bytes || 0; }
   meta.filename = meta.filename || filename;
   meta.alloc_url = 'https://www.allocine.fr/rechercher/movie/?q=' + encodeURIComponent(meta.title);
   if (d.tmdb_id) meta.tmdb_url = 'https://www.themoviedb.org/movie/' + d.tmdb_id;
