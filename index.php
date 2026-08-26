@@ -124,8 +124,11 @@ function current_dir() {
 
 // ── File helpers ───────────────────────────────────────────────────────────────
 function fmt_size($bytes) {
-    // Use float to handle large files correctly on 32-bit PHP
-    $b = (float)sprintf('%u', (int)$bytes);
+    // Callers already pass a value recovered from the 32-bit filesize()/stat()
+    // wraparound via sprintf('%u', ...) — casting that (possibly >2GB) numeric
+    // string through (int) here would clamp it straight back down to
+    // PHP_INT_MAX (~2GB) on a 32-bit build, so go through float directly.
+    $b = (float)$bytes;
     if ($b >= 1073741824) return round($b / 1073741824, 2) . ' GB';
     if ($b >= 1048576)    return round($b / 1048576, 1)    . ' MB';
     if ($b >= 1024)       return round($b / 1024, 1)       . ' KB';
@@ -170,22 +173,27 @@ function fm_current_filesize($dir, $filename) {
 // truncated/wrong-size file regardless of how big it was.
 function fm_send_file($path, $mime, $disposition_header, $cache_control = 'no-cache') {
     clearstatcache(true, $path);
-    $size = filesize($path);
+    // filesize() wraps around to a negative int for files >2GB on 32-bit PHP
+    // builds; sprintf('%u', ...) reinterprets that bit pattern as unsigned to
+    // recover the true size, and casting to float (not int) keeps it intact —
+    // this is what was still broken here (raw filesize() reached curl/browsers
+    // as an invalid/negative Content-Length, truncating every large download).
+    $size = (float)sprintf('%u', filesize($path));
     $fp   = fopen($path, 'rb');
-    if ($size === false || !$fp) { http_response_code(404); exit; }
+    if ($size <= 0 || !$fp) { http_response_code(404); exit; }
 
-    $start = 0;
+    $start = 0.0;
     $end   = $size - 1;
     $status = 200;
 
     if (isset($_SERVER['HTTP_RANGE']) && preg_match('/bytes=(\d*)-(\d*)/', $_SERVER['HTTP_RANGE'], $m)) {
         $has_start = ($m[1] !== '');
         $has_end   = ($m[2] !== '');
-        if ($has_start) { $start = (int)$m[1]; }
-        if ($has_end)   { $end = (int)$m[2]; }
+        if ($has_start) { $start = (float)$m[1]; }
+        if ($has_end)   { $end = (float)$m[2]; }
         elseif ($has_start) { $end = $size - 1; }
         else { // suffix range: bytes=-N
-            $start = max(0, $size - (int)$m[2]);
+            $start = max(0, $size - (float)$m[2]);
             $end   = $size - 1;
         }
         if ($start > $end || $start >= $size || $end >= $size) {

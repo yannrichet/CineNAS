@@ -1,0 +1,38 @@
+# Environnement de diagnostic pour le bug "fichier >2Go tronque au telechargement".
+# Lance CineNAS reel (index.php du depot parent) sous PHP 64-bit ET PHP 32-bit
+# en parallele, avec un faux film de 3.9 Gio (fichier creux, quasi aucun espace
+# disque reel utilise), pour comparer directement le comportement des deux.
+#
+# Usage:
+#   cd diag && docker compose up --build
+#   -> http://localhost:8064/  (PHP 64-bit)  mot de passe: test1234
+#   -> http://localhost:8032/  (PHP 32-bit)  mot de passe: test1234
+#   -> diagnostic brut: http://localhost:8064/diag.php  et  :8032/diag.php
+#
+# Si le pull de l'image linux/386 echoue (emulation manquante), executez une
+# fois: docker run --privileged --rm tonistiigi/binfmt --install all
+
+services:
+  php64:
+    build:
+      context: .
+      args:
+        PHP_BASE: php:8.3-cli-bookworm
+    platform: linux/amd64
+    volumes:
+      - ..:/app
+      - ./diag.php:/app/diag.php:ro
+    ports:
+      - "8064:8080"
+
+  php32:
+    build:
+      context: .
+      args:
+        PHP_BASE: php:8.3-cli-bookworm
+    platform: linux/386
+    volumes:
+      - ..:/app
+      - ./diag.php:/app/diag.php:ro
+    ports:
+      - "8032:8080"

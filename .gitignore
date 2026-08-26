@@ -15,3 +15,11 @@ tmdbtest.php
 
 # Anciennes versions
 *.old
+
+# Cache scan + posters téléchargés (générés à l'exécution)
+.scan_cache.json
+.posters/
+
+# Environnement de diagnostic Docker (diag/docker-compose.yml) : fichier de
+# test creux + config générée dans la racine du dépôt via le bind mount
+testfile.mkv
