@@ -23,3 +23,4 @@ tmdbtest.php
 # Environnement de diagnostic Docker (diag/docker-compose.yml) : fichier de
 # test creux + config générée dans la racine du dépôt via le bind mount
 testfile.mkv
+/diag.php

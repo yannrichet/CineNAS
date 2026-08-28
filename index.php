@@ -137,10 +137,22 @@ function fmt_size($bytes) {
 // filesize() overflows to a negative/wrapped int for files >2GB on 32-bit PHP builds,
 // which corrupts the Content-Length header sent to the browser/VLC and truncates
 // downloads. clearstatcache() avoids a stale cached size, sprintf('%u', ...) undoes
-// the 32-bit wraparound.
+// the 32-bit wraparound — but only for the 2-4GB range, where the wrapped value is
+// negative. Past 4GB the true size no longer fits in a 32-bit zend_long at all, so
+// filesize() truncates it *before* wrapping and returns a wrong-but-positive number
+// with no way to recover the missing high bits from within PHP. Shelling out to
+// `stat`, which reads the real 64-bit size from a text-based syscall wrapper, is the
+// only reliable fix on affected (32-bit) builds.
 function fm_filesize($f) {
     clearstatcache(true, $f);
-    return sprintf('%u', (int)filesize($f));
+    $size = sprintf('%u', (int)filesize($f));
+    if (PHP_INT_SIZE === 4 && stripos(PHP_OS, 'WIN') === false && function_exists('shell_exec')) {
+        $out = @shell_exec('stat -c%s ' . escapeshellarg($f) . ' 2>/dev/null');
+        if ($out !== null && ctype_digit(trim($out))) {
+            $size = trim($out);
+        }
+    }
+    return $size;
 }
 // Fresh (non-cached) size for a file in $dir, summing multi-part siblings
 // (Movie.CD1.mkv + Movie.CD2.mkv) the same way the main listing does. Used to
@@ -172,13 +184,10 @@ function fm_current_filesize($dir, $filename) {
 // byte 0 with a 200 status, so the client's range-based reassembly ended up with a
 // truncated/wrong-size file regardless of how big it was.
 function fm_send_file($path, $mime, $disposition_header, $cache_control = 'no-cache') {
-    clearstatcache(true, $path);
-    // filesize() wraps around to a negative int for files >2GB on 32-bit PHP
-    // builds; sprintf('%u', ...) reinterprets that bit pattern as unsigned to
-    // recover the true size, and casting to float (not int) keeps it intact —
-    // this is what was still broken here (raw filesize() reached curl/browsers
-    // as an invalid/negative Content-Length, truncating every large download).
-    $size = (float)sprintf('%u', filesize($path));
+    // See fm_filesize() for why this can't just be (float)filesize($path) on
+    // 32-bit PHP: files >=4GB lose their high bits before any sign wraparound
+    // we could undo, so it shells out to `stat` to get the real size.
+    $size = (float)fm_filesize($path);
     $fp   = fopen($path, 'rb');
     if ($size <= 0 || !$fp) { http_response_code(404); exit; }
 
@@ -838,7 +847,9 @@ function do_scan_recursive($dir, $tag) {
             $subs_by_base[$base][] = array('name' => $e, 'rel' => $rel, 'ext' => $ext_check);
         } elseif (in_array($ext_check, $video_ext, true)) {
             $stat  = @stat($abs);
-            $bytes = ($stat && isset($stat['size'])) ? sprintf('%u', $stat['size']) : 0;
+            // fm_filesize(), not $stat['size'] directly: stat()'s size is subject to
+            // the same 32-bit truncation as filesize() (see fm_filesize() below).
+            $bytes = $stat ? fm_filesize($abs) : 0;
             $total_bytes += (float)$bytes;
             $rel   = str_replace(DIRECTORY_SEPARATOR, '/', ltrim(substr($abs, strlen(FM_ROOT)), DIRECTORY_SEPARATOR));
             $all_files[] = array(
