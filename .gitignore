@@ -24,3 +24,6 @@ tmdbtest.php
 # test creux + config générée dans la racine du dépôt via le bind mount
 testfile.mkv
 /diag.php
+
+# Films de test réels utilisés pour reproduire les bugs de taille >2/4Go
+/Legends.2026.S01.MULTi.1080p.WEB.x264-FW/
